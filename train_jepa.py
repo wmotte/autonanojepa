@@ -34,13 +34,13 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 N_EMBD = 256
 DEPTH = 4
-N_HEAD = 8            # Doubled from 4
+N_HEAD = 16            # Doubled from 8
 EMA_TAU = 0.996
 VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 1.0
 VICREG_COV = 0.1        # Covariance regularization weight (decorrelates z_ctx dims)
 DEVICE_BATCH_SIZE = 96
-MATRIX_LR = 0.001
+MATRIX_LR = 0.002
 EMBEDDING_LR = 0.01
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.05   # 5% warmup
