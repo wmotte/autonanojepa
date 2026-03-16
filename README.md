@@ -1,8 +1,55 @@
+> Design inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch)
+
 # nanoJEPA — Clojure Execution Prediction on Apple Silicon
 
 An MLX implementation of a Joint Embedding Predictive Architecture (JEPA) whose task is to **evaluate Clojure expressions in latent space**: given the embedding of a Clojure expression, predict the embedding of its result — without ever generating tokens.
 
 This runs natively on Apple Silicon via MLX (unified memory, no PyTorch, no CUDA). The autoresearch loop (`program_jepa.md`) iteratively improves the model within a fixed time budget.
+
+---
+
+## Background & Motivation
+
+### The problem with autoregressive evaluation
+
+Standard language models learn to evaluate code the same way they learn everything else: by predicting the next token. When asked `(+ 3 5)`, a GPT-style model generates `8` by sampling from a probability distribution over its entire vocabulary, one token at a time. This works, but it is fundamentally the wrong level of abstraction for program semantics. The model does not need to know what `8` *looks like* — it needs to know what it *means*.
+
+Token generation conflates two very different problems:
+1. **Semantic understanding** — knowing that `(+ 3 5)` evaluates to the integer eight
+2. **Surface rendering** — knowing that the integer eight is spelled `8` in a given context
+
+For most downstream uses of code understanding (retrieval, program synthesis, bug detection, reachability analysis), only (1) matters. Forcing the model to solve (2) as a prerequisite adds unnecessary complexity, a large output head, and a training objective that rewards surface-level pattern matching over genuine semantic reasoning.
+
+### What JEPA does differently
+
+Joint Embedding Predictive Architectures (JEPAs), introduced by LeCun and collaborators in the context of vision (I-JEPA, V-JEPA), flip this around: instead of predicting *tokens*, the model predicts *representations*. Given an input, the context encoder produces a latent embedding; a lightweight predictor then maps that embedding to the expected embedding of some related view — without ever decoding back to tokens.
+
+Applied to code execution, the two views are:
+- **Expression view**: the Clojure source `(+ 3 5)`
+- **Result view**: the value `8`
+
+The model's job is to learn a representation space in which `(+ 3 5)` and `8` are geometrically close — not by memorising that the string `"8"` follows the string `"(+ 3 5)"`, but by learning the *transformation* that execution applies in embedding space.
+
+This is closer to how humans reason about code: we mentally evaluate expressions without reciting their character-by-character output.
+
+### Why Clojure?
+
+Clojure is a near-ideal testbed for latent execution prediction:
+
+- **Pure, referentially transparent semantics.** The same expression always evaluates to the same result. There are no side effects, no mutable state, and no environment dependencies to track. The expression → result mapping is a true mathematical function, which is exactly what we want the embedding space to encode.
+- **Homoiconic, minimal syntax.** Clojure code is data (S-expressions). The entire syntax relevant to this project fits in 96 tokens — small enough to study in full without subword tokenisation or BPE merges.
+- **Synthetic data generation without a runtime.** Because the expression family is finite and well-specified, Python can generate valid (expression, result) pairs directly — no Clojure JVM required. Training data is infinite, non-repeating, and perfectly balanced across difficulty levels.
+- **Semantic gap between expression and result.** For families like sequential `let` bindings or multiplication chains, the result is almost never visible as a literal token in the expression. The model cannot shortcut by copying tokens — it must learn the computation.
+
+### Why Apple Silicon / MLX?
+
+The goal is accessible, reproducible research with fast iteration. MLX runs natively on the Apple Neural Engine and GPU via unified memory — no discrete GPU, no CUDA, no data-copy overhead between CPU and device memory. A MacBook Pro M-series chip can run ~6,000 training steps in two minutes. This makes the autoresearch loop (tens of experiments per hour) practical without cloud compute.
+
+### The autoresearch angle
+
+This project is not just a model — it is a research environment. The `program_jepa.md` protocol turns an AI coding agent into an autonomous experimenter: propose a hypothesis, edit `train_jepa.py`, commit, run, measure, log, keep or discard. The agent operates within a fixed 2-minute time budget per run, so dozens of experiments can be evaluated in a single session.
+
+The broader question being investigated is: **how much of program semantics can be captured by a ~4M parameter model trained purely in latent space on synthetic data, in under two minutes?** The answer, so far, is more than you might expect.
 
 ---
 
