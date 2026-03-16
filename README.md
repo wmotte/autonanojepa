@@ -194,6 +194,16 @@ Aggregate a sequence, then apply a second operation. The `mod` variant produces 
 
 ---
 
+## Running the agent
+
+Spin up Claude Code (or any capable coding agent) in this repo with all permissions disabled, then prompt:
+
+> Have a look at `program_jepa.md` and let's kick off a new experiment — let's do the setup first.
+
+`program_jepa.md` acts as a lightweight skill: it gives the agent everything it needs to run the autoresearch loop autonomously — branch naming, what to edit, how to run, how to log results, and when to keep or discard a run.
+
+---
+
 ## Setup
 
 ```bash
