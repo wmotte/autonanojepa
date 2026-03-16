@@ -39,7 +39,8 @@ EMA_TAU = 0.9995
 VICREG_LAMBDA = 0.5
 VICREG_GAMMA = 0.2
 VICREG_COV = 0.05        # Covariance regularization weight (decorrelates z_ctx dims)
-DEVICE_BATCH_SIZE = 80
+HARD_NEG_WEIGHT = 0.1    # Weight for hard negative penalty
+DEVICE_BATCH_SIZE = 64
 MATRIX_LR = 0.0005
 EMBEDDING_LR = 0.005
 WEIGHT_DECAY = 0.01
@@ -208,9 +209,22 @@ def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask
     z_pred_n = z_pred * mx.rsqrt(mx.sum(z_pred * z_pred, axis=-1, keepdims=True) + 1e-8)
     z_tgt_n = z_tgt * mx.rsqrt(mx.sum(z_tgt * z_tgt, axis=-1, keepdims=True) + 1e-8)
 
-    # Cosine loss
+    # Cosine loss (positive pair)
     cos_sim = mx.sum(z_pred_n * z_tgt_n, axis=-1)  # (B,)
     main_loss = 1.0 - mx.mean(cos_sim)
+    
+    # In-batch hard negative mining:
+    # For each prediction, find the most similar target in the batch that is NOT its own target.
+    # sim_matrix: (B, B) where sim[i, j] = cos_sim(z_pred_i, z_tgt_j)
+    sim_matrix = mx.matmul(z_pred_n, mx.transpose(z_tgt_n))
+    B = sim_matrix.shape[0]
+    # Mask out the diagonal (positive pairs)
+    diag_mask = mx.eye(B) * -2.0 # Pull diagonal below possible range [-1, 1]
+    sim_matrix_masked = sim_matrix + diag_mask
+    # Find max similarity to other targets in batch
+    hard_neg_sim = mx.max(sim_matrix_masked, axis=1) # (B,)
+    # We want to minimize this similarity (push hard negatives away)
+    neg_loss = mx.mean(mx.maximum(hard_neg_sim, 0.0))
 
     # VICReg variance on z_pred (penalise collapsed predictor dimensions)
     z_pred_centered = z_pred - mx.mean(z_pred, axis=0, keepdims=True)
@@ -231,6 +245,7 @@ def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask
 
     return (
         main_loss
+        + HARD_NEG_WEIGHT * neg_loss
         + VICREG_LAMBDA * (var_pred_loss + var_ctx_loss)
         + VICREG_COV * cov_loss
     )
