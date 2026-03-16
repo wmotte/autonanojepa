@@ -32,16 +32,16 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # Hyperparameters (editable by autoresearch loop)
 # ---------------------------------------------------------------------------
 
-N_EMBD = 256
+N_EMBD = 320
 DEPTH = 4
-N_HEAD = 8            # Doubled from 4
-EMA_TAU = 0.996
-VICREG_LAMBDA = 1.0
-VICREG_GAMMA = 1.0
-VICREG_COV = 0.04        # Covariance regularization weight (decorrelates z_ctx dims)
-DEVICE_BATCH_SIZE = 64
-MATRIX_LR = 0.001
-EMBEDDING_LR = 0.01
+N_HEAD = 5            # 320 // 5 = 64
+EMA_TAU = 0.9995
+VICREG_LAMBDA = 0.5
+VICREG_GAMMA = 0.2
+VICREG_COV = 0.05        # Covariance regularization weight (decorrelates z_ctx dims)
+DEVICE_BATCH_SIZE = 80
+MATRIX_LR = 0.0005
+EMBEDDING_LR = 0.005
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.05   # 5% warmup
 WARMDOWN_RATIO = 0.4  # Cosine decay over final 40%
@@ -151,8 +151,8 @@ class NanoJEPA(nn.Module):
         self.pred_fc3 = nn.Linear(4 * n_embd, n_embd, bias=False)
 
     def predict(self, z):
-        h = mx.maximum(self.pred_fc1(z), 0)
-        h = mx.maximum(self.pred_fc2(h), 0)
+        h = norm(mx.maximum(self.pred_fc1(z), 0))
+        h = norm(mx.maximum(self.pred_fc2(h), 0))
         return self.pred_fc3(h)
 
     def __call__(self, expr_tokens, expr_mask):
