@@ -79,7 +79,7 @@ Four layers prevent this:
 
 ### Why `z_ctx` regularization matters
 
-The original VICReg penalty only covered `z_pred`. The target encoder has no direct gradient path — it is updated purely via EMA — so its collapse goes unpunished. The fix: regularise `z_ctx` (which is gradient-connected), and rely on EMA to propagate the spread into the target encoder. The covariance term additionally prevents all dimensions from collapsing onto a low-dimensional manifold while still passing the variance check.
+The target encoder has no direct gradient path — it is updated purely via EMA — so its collapse cannot be penalised directly. Regularising `z_ctx` (which is gradient-connected) solves this indirectly: the EMA update propagates spread from the context encoder into the target encoder. The covariance term additionally prevents all dimensions from collapsing onto a low-dimensional manifold while still passing the variance check.
 
 ---
 
