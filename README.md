@@ -259,7 +259,7 @@ Products are typically absent from the expression's literal tokens. `(* x x)` = 
 (let [a 3 b (* a 4)] (+ b 2))   → 14
 (let [x 2 y (+ x 3)] (* y 2))  → 10
 ```
-Second binding uses the first (true Clojure `let` semantics). Result requires two levels of computation; the answer virtually never appears as a token in the expression.
+Second binding uses the first — this is `let*` semantics (sequential scoping), not standard Clojure `let` (which is parallel). The Python evaluator implements it correctly as sequential; the expressions are valid `let*` forms. Result requires two levels of computation; the answer virtually never appears as a token in the expression.
 
 ### K — HOF cross-product (4%) **hard**
 ```clojure

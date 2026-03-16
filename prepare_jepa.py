@@ -24,7 +24,7 @@ TIME_BUDGET = 120
 N_VAL_PAIRS = 2000
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch_jepa")
-VAL_CACHE_PATH = os.path.join(CACHE_DIR, "val_pairs_v2.npz")
+VAL_CACHE_PATH = os.path.join(CACHE_DIR, "val_pairs_v3.npz")
 
 # ---------------------------------------------------------------------------
 # Vocabulary
@@ -74,7 +74,7 @@ class ClojureVocab:
         if isinstance(token_list, str):
             # Try splitting as space-separated
             token_list = token_list.split()
-        return [self.token_to_id[t] for t in token_list if t in self.token_to_id]
+        return [self.token_to_id[t] for t in token_list]
 
     def decode(self, ids):
         return [self.id_to_token.get(i, "?") for i in ids if i not in (PAD_ID,)]
@@ -225,7 +225,7 @@ def _gen_hof(rng):
         result = max(-10, min(30, int(round(result))))
         return toks, [_num_tok(result)]
 
-    elif choice < 0.8:
+    else:
         # (first [a b c]) or (last [a b c])
         n = rng.randint(2, 5)
         elems = [rng.randint(-5, 15) for _ in range(n)]
@@ -233,13 +233,6 @@ def _gen_hof(rng):
         result = elems[0] if fn == "first" else elems[-1]
         toks = ["(", fn, "["] + [_num_tok(e) for e in elems] + ["]", ")"]
         return toks, [_num_tok(result)]
-
-    else:
-        # (count [a b c]) variant — simple
-        n = rng.randint(1, 4)
-        elems = [rng.randint(0, 10) for _ in range(n)]
-        toks = ["(", "count", "["] + [_num_tok(e) for e in elems] + ["]", ")"]
-        return toks, [_num_tok(n)]
 
 
 def _gen_conditional(rng):
@@ -441,8 +434,11 @@ def _gen_product(rng):
 
 
 def _gen_seq_let(rng):
-    """Family J: sequential let where second binding uses first.
+    """Family J: sequential let* where second binding uses first.
     (let [a 3 b (* a 4)] (+ b 2)) → 14 — result absent from tokens.
+    Note: standard Clojure `let` has parallel bindings; this implements `let*`
+    semantics (second binding sees first). The Python evaluator is correct;
+    the expressions are valid let* forms, not let forms.
     """
     var1 = rng.choice(["a", "n", "x", "y"])
     var2 = rng.choice([v for v in ["a", "b", "n", "x", "y", "z"] if v != var1])
@@ -550,22 +546,27 @@ def generate_pair(rng):
 
 
 def encode_pair(vocab, expr_toks, res_toks, max_expr=MAX_EXPR_LEN, max_res=MAX_RESULT_LEN):
-    """Encode token lists to padded integer arrays."""
-    expr_ids = [BOS_ID] + vocab.encode(expr_toks)
+    """Encode token lists to padded integer arrays with BOS/EOS framing.
+
+    Masks are stored as float32 to avoid a dtype cast on every batch load.
+    SEP_ID is reserved for future use (e.g. expression/result separator in
+    a joint sequence). EOS_ID terminates each sequence before padding.
+    """
+    expr_ids = [BOS_ID] + vocab.encode(expr_toks) + [EOS_ID]
     expr_ids = expr_ids[:max_expr]
-    expr_mask = [1] * len(expr_ids) + [0] * (max_expr - len(expr_ids))
+    expr_mask = [1.0] * len(expr_ids) + [0.0] * (max_expr - len(expr_ids))
     expr_ids = expr_ids + [PAD_ID] * (max_expr - len(expr_ids))
 
-    res_ids = [BOS_ID] + vocab.encode(res_toks)
+    res_ids = [BOS_ID] + vocab.encode(res_toks) + [EOS_ID]
     res_ids = res_ids[:max_res]
-    res_mask = [1] * len(res_ids) + [0] * (max_res - len(res_ids))
+    res_mask = [1.0] * len(res_ids) + [0.0] * (max_res - len(res_ids))
     res_ids = res_ids + [PAD_ID] * (max_res - len(res_ids))
 
     return (
         np.array(expr_ids, dtype=np.int32),
-        np.array(expr_mask, dtype=np.int32),
+        np.array(expr_mask, dtype=np.float32),
         np.array(res_ids, dtype=np.int32),
-        np.array(res_mask, dtype=np.int32),
+        np.array(res_mask, dtype=np.float32),
     )
 
 
@@ -607,9 +608,13 @@ def _generate_val_cache():
 # Training dataloader
 # ---------------------------------------------------------------------------
 
-def make_jepa_dataloader(vocab, batch_size):
-    """Infinite generator of (expr, expr_mask, res, res_mask) batches."""
-    rng = random.Random()
+def make_jepa_dataloader(vocab, batch_size, seed=None):
+    """Infinite generator of (expr, expr_mask, res, res_mask) batches.
+
+    seed=None (default) gives non-repeating, non-reproducible training data.
+    Pass an integer seed for fully reproducible training runs.
+    """
+    rng = random.Random(seed)
     while True:
         exprs, expr_masks, ress, res_masks = [], [], [], []
         for _ in range(batch_size):

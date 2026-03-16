@@ -81,12 +81,12 @@ LOOP FOREVER:
 
 1. Check git state (branch/commit).
 2. Modify `train_jepa.py` with an experimental idea.
-3. `git add autoresearch-mlx/train_jepa.py && git commit -m "experiment: <description>"`
+3. `git add train_jepa.py && git commit -m "experiment: <description>"`
 4. Run: `uv run train_jepa.py > run.log 2>&1`
 5. Check: `grep "^val_recall_at_1_pct:\|^peak_vram_mb:" run.log`
 6. If empty → crashed. Run `tail -n 50 run.log` for stack trace.
 7. Record in `results_jepa.tsv`.
-8. If `val_recall_at_1_pct` **improved** (higher): `git add autoresearch-mlx/results_jepa.tsv && git commit --amend --no-edit`
+8. If `val_recall_at_1_pct` **improved** (higher): `git add results_jepa.tsv && git commit -m "results: <description>"`
 9. If equal or worse: record hash, then `git reset --hard <previous kept commit>`
 
 **Timeout**: ~3 min per experiment. Kill and discard if >8 min.
@@ -101,7 +101,7 @@ Hyperparameter tuning alone is unlikely to produce a meaningful contribution. At
 
 1. **Deeper / wider predictor**: The 3-layer MLP may be too shallow to simulate multi-step reduction. Try 4–6 layers, residual connections, or a small transformer predictor that operates over the context embedding as a sequence of "reduction steps."
 
-2. **Explicit intermediate state representations**: Add auxiliary loss terms that encourage the predictor's hidden layers to represent identifiable intermediate values (e.g., the result of the inner sub-expression before the outer one is applied). This can be implemented by generating expression–subresult pairs from the data generator's existing structure and supervising intermediate activations.
+2. **Explicit intermediate state representations**: Add auxiliary loss terms that encourage the predictor's hidden layers to represent identifiable intermediate values (e.g., the result of the inner sub-expression before the outer one is applied). This can be implemented by generating expression–subresult pairs from the data generator's existing structure and supervising intermediate activations. *(Already partially implemented: `INTER_LOSS_WEIGHT * inter_loss` supervises h2 against the target. Next step: supervise h1 as well, or generate genuine subexpression–subresult pairs from the data generator rather than reusing the same target embedding.)*
 
 3. **Curriculum from easy to hard families**: Train first on families A–B (arithmetic, single let), then introduce C–H (HOF, conditionals, multi-binding), and only later expose the model to I–J–K (multiplication, sequential let, cross-product). A staged curriculum lets the model build compositional representations before facing cases where the result is not a literal token in the input.
 
@@ -113,7 +113,7 @@ Hyperparameter tuning alone is unlikely to produce a meaningful contribution. At
 
 7. **Multi-step predictor unrolling**: Replace the single MLP forward pass with K unrolled steps, each refining the predicted embedding. Concretely, the predictor receives `(z_ctx, h_{k-1})` and outputs `h_k`; the final `h_K` is compared to `z_target`. This recurrent structure directly mimics iterative reduction and gives the model a mechanism to perform multi-hop reasoning within the predictor rather than expecting a single MLP to do it all at once.
 
-8. **Momentum contrast queue (MoCo-style)**: The current batch of 96 provides only 95 negatives per anchor. Maintain a first-in-first-out queue of recent `z_target` embeddings (e.g., 2048–4096 entries) as a memory bank. The predictor must retrieve the correct result from this much larger pool, producing a far stronger gradient signal and forcing sharper embeddings without requiring a larger batch.
+8. **Momentum contrast queue (MoCo-style)**: The current batch of 96 provides only 95 negatives per anchor. Maintain a first-in-first-out queue of recent `z_target` embeddings (e.g., 2048–4096 entries) as a memory bank. The predictor must retrieve the correct result from this much larger pool, producing a far stronger gradient signal and forcing sharper embeddings without requiring a larger batch. *(Already implemented with `QUEUE_SIZE=2048` and `QUEUE_WEIGHT=0.1`. Was previously broken due to MLX in-place slice assignment semantics — now fixed (numpy ring buffer). Worth tuning `QUEUE_SIZE` and `QUEUE_WEIGHT`.)*
 
 9. **Auxiliary result-type classification head**: Add a small classification head on top of `z_pred` that predicts a coarse category of the result (e.g., negative integer, zero-to-ten, large positive, boolean, list). Train this with cross-entropy alongside the primary cosine loss. The auxiliary signal provides a direct semantic anchor — the model cannot satisfy the type head via representation collapse — and costs almost nothing computationally.
 

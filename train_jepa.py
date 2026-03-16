@@ -54,35 +54,35 @@ WARMDOWN_RATIO = 0.4  # Cosine decay over final 40%
 # Global queue for MoCo-style contrastive loss
 # ---------------------------------------------------------------------------
 
-_NEG_QUEUE = None
+_NEG_QUEUE: np.ndarray | None = None  # numpy array — MLX arrays don't support in-place slice assignment
 _QUEUE_PTR = 0
 
 def update_queue(z_tgt):
+    """Store L2-normalised target embeddings in a numpy ring buffer."""
     global _NEG_QUEUE, _QUEUE_PTR
-    B = z_tgt.shape[0]
-    z_tgt = mx.stop_gradient(z_tgt)
-    # L2 normalize
-    z_tgt_n = z_tgt * mx.rsqrt(mx.sum(z_tgt * z_tgt, axis=-1, keepdims=True) + 1e-8)
-    
+    mx.eval(z_tgt)
+    z_np = np.array(z_tgt, copy=False).astype(np.float32)
+    norms = np.linalg.norm(z_np, axis=-1, keepdims=True) + 1e-8
+    z_np = z_np / norms
+
+    B = z_np.shape[0]
     if _NEG_QUEUE is None:
-        _NEG_QUEUE = mx.zeros((QUEUE_SIZE, N_EMBD))
-        
+        _NEG_QUEUE = np.zeros((QUEUE_SIZE, N_EMBD), dtype=np.float32)
+
     end = _QUEUE_PTR + B
     if end <= QUEUE_SIZE:
-        _NEG_QUEUE[_QUEUE_PTR:end] = z_tgt_n
+        _NEG_QUEUE[_QUEUE_PTR:end] = z_np
     else:
-        # Wrap around
         rem = QUEUE_SIZE - _QUEUE_PTR
-        _NEG_QUEUE[_QUEUE_PTR:QUEUE_SIZE] = z_tgt_n[:rem]
-        _NEG_QUEUE[0:B-rem] = z_tgt_n[rem:]
-    
+        _NEG_QUEUE[_QUEUE_PTR:] = z_np[:rem]
+        _NEG_QUEUE[:B - rem] = z_np[rem:]
+
     _QUEUE_PTR = (_QUEUE_PTR + B) % QUEUE_SIZE
 
 def get_queue():
-    global _NEG_QUEUE
     if _NEG_QUEUE is None:
         return None
-    return _NEG_QUEUE
+    return mx.array(_NEG_QUEUE)
 
 # ---------------------------------------------------------------------------
 # Utilities (copied from train.py)
@@ -189,13 +189,13 @@ class NanoJEPA(nn.Module):
         self.pred_fc3 = nn.Linear(4 * n_embd, n_embd, bias=False)
 
     def predict(self, z):
-        h = norm(mx.maximum(self.pred_fc1(z), 0))
-        h = norm(mx.maximum(self.pred_fc2(h), 0))
-        return self.pred_fc3(h)
+        h1 = norm(mx.maximum(self.pred_fc1(z), 0))
+        h2 = norm(mx.maximum(self.pred_fc2(h1), 0))
+        return self.pred_fc3(h2), h2
 
     def __call__(self, expr_tokens, expr_mask):
         z_ctx = self.ctx_encoder(expr_tokens, expr_mask)
-        z_pred = self.predict(z_ctx)
+        z_pred, _ = self.predict(z_ctx)
         return z_pred
 
 
@@ -239,7 +239,7 @@ def _set_nested(obj, path, value):
 
 def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask):
     z_ctx = model.ctx_encoder(expr_tokens, expr_mask)
-    z_pred = model.predict(z_ctx)
+    z_pred, z_pred_mid = model.predict(z_ctx)
     z_tgt = mx.stop_gradient(target_enc(res_tokens, res_mask))
 
     # L2-normalize for cosine loss
@@ -249,12 +249,9 @@ def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask
     # Cosine loss (positive pair)
     cos_sim = mx.sum(z_pred_n * z_tgt_n, axis=-1)  # (B,)
     main_loss = 1.0 - mx.mean(cos_sim)
-    
-    # Intermediate sub-expression loss (Direction 2 simplified)
-    # Supervise the middle layer of the predictor to also align with the target.
-    h1 = norm(mx.maximum(model.pred_fc1(z_ctx), 0))
-    h2 = norm(mx.maximum(model.pred_fc2(h1), 0))
-    z_pred_mid = h2
+
+    # Intermediate supervision: h2 (second predictor layer) should also align with target.
+    # h2 is returned by predict() — no recomputation needed.
     z_pred_mid_n = z_pred_mid * mx.rsqrt(mx.sum(z_pred_mid * z_pred_mid, axis=-1, keepdims=True) + 1e-8)
     inter_loss = 1.0 - mx.mean(mx.sum(z_pred_mid_n * z_tgt_n, axis=-1))
 
@@ -507,14 +504,14 @@ while True:
     optimizer.update(model, grads)
     mx.eval(model.parameters(), *optimizer.state)
 
-    # EMA update of target encoder
-    ema_update(target_enc, model.ctx_encoder, EMA_TAU)
-    
-    # Update MoCo queue
+    # EMA update of target encoder (skip step 0 — used only for compilation)
+    if step > 0:
+        ema_update(target_enc, model.ctx_encoder, EMA_TAU)
+
+    # Update MoCo queue with post-EMA target embeddings
     z_tgt_for_queue = target_enc(res_t, res_m)
-    mx.eval(z_tgt_for_queue)
-    update_queue(z_tgt_for_queue)
-    
+    update_queue(z_tgt_for_queue)  # mx.eval happens inside update_queue
+
     mx.eval(target_enc.parameters())
 
     loss_f = float(loss.item())
