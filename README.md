@@ -1,4 +1,4 @@
-> Design inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch)
+e Design inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch)
 
 # nanoJEPA — Clojure Execution Prediction on Apple Silicon
 
@@ -49,7 +49,9 @@ The goal is accessible, reproducible research with fast iteration. MLX runs nati
 
 This project is not just a model — it is a research environment. The `program_jepa.md` protocol turns an AI coding agent into an autonomous experimenter: propose a hypothesis, edit `train_jepa.py`, commit, run, measure, log, keep or discard. The agent operates within a fixed 2-minute time budget per run, so dozens of experiments can be evaluated in a single session.
 
-The broader question being investigated is: **how much of program semantics can be captured by a ~4M parameter model trained purely in latent space on synthetic data, in under two minutes?** The answer, so far, is more than you might expect.
+The larger aim is **Neural Execution Models** (NEMs): neural networks that do not simulate a program by generating its output tokens, but instead model program execution as a continuous transformation in embedding space. A NEM takes a program representation and produces a representation of its result — potentially composing multiple execution steps without ever surfacing discrete symbols.
+
+nanoJEPA is a minimal proof-of-concept in this direction. If a small JEPA model can learn a reliable latent map from Clojure expressions to their results on a restricted vocabulary, it demonstrates that execution semantics are geometrically learnable — that there exists a useful structure in embedding space that mirrors what an interpreter does. Scaling this idea raises harder questions: can the same principle extend to multi-step programs, richer type systems, or real-world code? Can latent execution be composed — i.e., can the predicted result embedding of one expression serve as the input to predicting another? These are the questions nanoJEPA is designed to probe at small scale before committing to larger experiments.
 
 ---
 
@@ -90,7 +92,34 @@ A 4-layer **bidirectional** Transformer (no causal mask). Input tokens attend to
 - Final LayerNorm on pooled output
 
 ### Target Encoder
-Identical architecture to the context encoder, but **updated only via Exponential Moving Average** of the context encoder's weights (τ=0.996). It never receives gradients — it's the "teacher" that provides stable training targets.
+Identical architecture to the context encoder, but **updated only via Exponential Moving Average** of the context encoder's weights (`EMA_TAU`). It never receives gradients — it's the "teacher" that provides stable training targets.
+
+Each training step updates the target encoder as:
+
+```
+θ_target ← τ · θ_target + (1 − τ) · θ_context
+```
+
+The target encoder's memory of its state `n` steps ago decays as τⁿ. The **half-life** — the number of steps until that memory is halved — is:
+
+```
+n½ = log(0.5) / log(τ)
+```
+
+| τ | half-life | character |
+|---|---|---|
+| 0.99 | ~69 steps | fast-moving, unstable target |
+| 0.996 | ~173 steps | BYOL/I-JEPA default |
+| 0.9995 | ~1,386 steps | slow-moving, very stable target |
+
+The value τ=0.996 originates from the **BYOL paper** (Grill et al., 2020), which popularised the EMA teacher-student setup that JEPA inherits. I-JEPA (Assran et al., 2023) uses the same value. It was not derived from first principles — it was tuned empirically on ImageNet-scale training and then adopted as a community default.
+
+The current code uses `EMA_TAU = 0.9995` because the encoders are **independently initialised** (rather than copied from each other at the start). Bridging the gap between two randomly initialised networks requires more time, so a slower-moving target gives the predictor room to learn before the target shifts again. With τ=0.9995 and ~6,000 steps, the target encoder goes through only ~4 half-lives over the full training run — it tracks the context encoder gradually rather than chasing it.
+
+The practical trade-off:
+- **τ too low**: target updates too fast → unstable training signal → loss oscillates
+- **τ too high**: target barely moves → predictor has too easy a job → slow learning
+- **τ=0.9995** (current): chosen to suit the short 120 s budget with independent init
 
 ### Predictor
 A **3-layer MLP**: `256 → 1024 → 1024 → 256` (ReLU activations). Maps the context embedding to the predicted target embedding.
@@ -316,7 +345,7 @@ The rise-then-plateau pattern is expected JEPA behaviour: the EMA target encoder
 `TIME_BUDGET = 120 s` (2 minutes). Reasoning:
 - ~20 ms/step → 120 s ≈ 6,000 steps
 - Shorter budget raises experiment throughput for the autoresearch loop (~7/hour → ~20/hour)
-- 120 s gives the EMA encoder time to properly stabilise (τ=0.996 → half-life ≈ 170 steps)
+- 120 s gives the EMA encoder time to properly stabilise (τ=0.9995 → half-life ≈ 1,386 steps → ~4 half-lives over the full run)
 - LR schedule: 5% linear warmup + flat + 40% cosine decay
 
 ---
