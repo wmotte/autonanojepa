@@ -42,7 +42,8 @@ VICREG_COV = 0.05        # Covariance regularization weight (decorrelates z_ctx 
 HARD_NEG_WEIGHT = 0.1    # Weight for hard negative penalty
 QUEUE_WEIGHT = 0.1       # Weight for queue-based contrastive loss
 QUEUE_SIZE = 2048
-DEVICE_BATCH_SIZE = 64
+INTER_LOSS_WEIGHT = 0.3  # Weight for intermediate sub-expression loss
+DEVICE_BATCH_SIZE = 48
 MATRIX_LR = 0.0005
 EMBEDDING_LR = 0.005
 WEIGHT_DECAY = 0.01
@@ -249,6 +250,14 @@ def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask
     cos_sim = mx.sum(z_pred_n * z_tgt_n, axis=-1)  # (B,)
     main_loss = 1.0 - mx.mean(cos_sim)
     
+    # Intermediate sub-expression loss (Direction 2 simplified)
+    # Supervise the middle layer of the predictor to also align with the target.
+    h1 = norm(mx.maximum(model.pred_fc1(z_ctx), 0))
+    h2 = norm(mx.maximum(model.pred_fc2(h1), 0))
+    z_pred_mid = h2
+    z_pred_mid_n = z_pred_mid * mx.rsqrt(mx.sum(z_pred_mid * z_pred_mid, axis=-1, keepdims=True) + 1e-8)
+    inter_loss = 1.0 - mx.mean(mx.sum(z_pred_mid_n * z_tgt_n, axis=-1))
+
     # In-batch hard negative mining
     sim_matrix = mx.matmul(z_pred_n, mx.transpose(z_tgt_n))
     B = sim_matrix.shape[0]
@@ -285,6 +294,7 @@ def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask
 
     return (
         main_loss
+        + INTER_LOSS_WEIGHT * inter_loss
         + HARD_NEG_WEIGHT * neg_loss
         + QUEUE_WEIGHT * queue_neg_loss
         + VICREG_LAMBDA * (var_pred_loss + var_ctx_loss)
