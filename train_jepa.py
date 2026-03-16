@@ -40,12 +40,48 @@ VICREG_LAMBDA = 0.5
 VICREG_GAMMA = 0.2
 VICREG_COV = 0.05        # Covariance regularization weight (decorrelates z_ctx dims)
 HARD_NEG_WEIGHT = 0.1    # Weight for hard negative penalty
+QUEUE_WEIGHT = 0.1       # Weight for queue-based contrastive loss
+QUEUE_SIZE = 2048
 DEVICE_BATCH_SIZE = 64
 MATRIX_LR = 0.0005
 EMBEDDING_LR = 0.005
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.05   # 5% warmup
 WARMDOWN_RATIO = 0.4  # Cosine decay over final 40%
+
+# ---------------------------------------------------------------------------
+# Global queue for MoCo-style contrastive loss
+# ---------------------------------------------------------------------------
+
+_NEG_QUEUE = None
+_QUEUE_PTR = 0
+
+def update_queue(z_tgt):
+    global _NEG_QUEUE, _QUEUE_PTR
+    B = z_tgt.shape[0]
+    z_tgt = mx.stop_gradient(z_tgt)
+    # L2 normalize
+    z_tgt_n = z_tgt * mx.rsqrt(mx.sum(z_tgt * z_tgt, axis=-1, keepdims=True) + 1e-8)
+    
+    if _NEG_QUEUE is None:
+        _NEG_QUEUE = mx.zeros((QUEUE_SIZE, N_EMBD))
+        
+    end = _QUEUE_PTR + B
+    if end <= QUEUE_SIZE:
+        _NEG_QUEUE[_QUEUE_PTR:end] = z_tgt_n
+    else:
+        # Wrap around
+        rem = QUEUE_SIZE - _QUEUE_PTR
+        _NEG_QUEUE[_QUEUE_PTR:QUEUE_SIZE] = z_tgt_n[:rem]
+        _NEG_QUEUE[0:B-rem] = z_tgt_n[rem:]
+    
+    _QUEUE_PTR = (_QUEUE_PTR + B) % QUEUE_SIZE
+
+def get_queue():
+    global _NEG_QUEUE
+    if _NEG_QUEUE is None:
+        return None
+    return _NEG_QUEUE
 
 # ---------------------------------------------------------------------------
 # Utilities (copied from train.py)
@@ -213,18 +249,22 @@ def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask
     cos_sim = mx.sum(z_pred_n * z_tgt_n, axis=-1)  # (B,)
     main_loss = 1.0 - mx.mean(cos_sim)
     
-    # In-batch hard negative mining:
-    # For each prediction, find the most similar target in the batch that is NOT its own target.
-    # sim_matrix: (B, B) where sim[i, j] = cos_sim(z_pred_i, z_tgt_j)
+    # In-batch hard negative mining
     sim_matrix = mx.matmul(z_pred_n, mx.transpose(z_tgt_n))
     B = sim_matrix.shape[0]
-    # Mask out the diagonal (positive pairs)
-    diag_mask = mx.eye(B) * -2.0 # Pull diagonal below possible range [-1, 1]
+    diag_mask = mx.eye(B) * -2.0
     sim_matrix_masked = sim_matrix + diag_mask
-    # Find max similarity to other targets in batch
-    hard_neg_sim = mx.max(sim_matrix_masked, axis=1) # (B,)
-    # We want to minimize this similarity (push hard negatives away)
+    hard_neg_sim = mx.max(sim_matrix_masked, axis=1)
     neg_loss = mx.mean(mx.maximum(hard_neg_sim, 0.0))
+    
+    # Queue-based negative mining (MoCo)
+    queue = get_queue()
+    if queue is not None:
+        # sim_queue: (B, QUEUE_SIZE)
+        sim_queue = mx.matmul(z_pred_n, mx.transpose(queue))
+        queue_neg_loss = mx.mean(mx.maximum(mx.max(sim_queue, axis=1), 0.0))
+    else:
+        queue_neg_loss = 0.0
 
     # VICReg variance on z_pred (penalise collapsed predictor dimensions)
     z_pred_centered = z_pred - mx.mean(z_pred, axis=0, keepdims=True)
@@ -246,6 +286,7 @@ def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask
     return (
         main_loss
         + HARD_NEG_WEIGHT * neg_loss
+        + QUEUE_WEIGHT * queue_neg_loss
         + VICREG_LAMBDA * (var_pred_loss + var_ctx_loss)
         + VICREG_COV * cov_loss
     )
@@ -458,6 +499,12 @@ while True:
 
     # EMA update of target encoder
     ema_update(target_enc, model.ctx_encoder, EMA_TAU)
+    
+    # Update MoCo queue
+    z_tgt_for_queue = target_enc(res_t, res_m)
+    mx.eval(z_tgt_for_queue)
+    update_queue(z_tgt_for_queue)
+    
     mx.eval(target_enc.parameters())
 
     loss_f = float(loss.item())
