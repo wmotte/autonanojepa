@@ -37,11 +37,11 @@ DEPTH = 4
 N_HEAD = 4            # 256 // 4 = 64
 EMA_TAU = 0.999
 VICREG_LAMBDA = 1.0
-VICREG_GAMMA = 0.5
+VICREG_GAMMA = 0.2
 VICREG_COV = 0.1        # Covariance regularization weight (decorrelates z_ctx dims)
 DEVICE_BATCH_SIZE = 96
 MATRIX_LR = 0.0005
-EMBEDDING_LR = 0.01
+EMBEDDING_LR = 0.005
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.05   # 5% warmup
 WARMDOWN_RATIO = 0.4  # Cosine decay over final 40%

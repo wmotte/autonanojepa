@@ -2,3 +2,4 @@ commit	val_recall_at_1	memory_gb	status	description
 7f3ce7f	1.4000	1.0	keep	baseline
 59a0be6	1.6500	0.9	keep	N_HEAD=4, GAMMA=0.5, BS=96
 d4caa16	1.7000	0.9	keep	MATRIX_LR=0.0005, EMA_TAU=0.999
+3e77ae7	1.8500	0.9	keep	EMB_LR=0.005, GAMMA=0.2
