@@ -40,9 +40,9 @@ DEPTH = 4
 N_HEAD = 4            # 160 // 4 = 40 (even for RoPE)
 EMA_TAU = 0.9995  # Slower EMA target update
 VICREG_LAMBDA = 1.0
-VICREG_GAMMA = 0.2  # Reduced from 0.5 (from original best config)
-VICREG_COV = 0.05   # Reduced from 0.1 (from original best config)
-SUBEXPR_WEIGHT = 0.25   # Sub-expression auxiliary loss weight (Gap 2)
+VICREG_GAMMA = 0.5
+VICREG_COV = 0.1        # Covariance regularization weight (decorrelates z_ctx dims)
+SUBEXPR_WEIGHT = 0.5  # Increased from 0.25
 DEVICE_BATCH_SIZE = 28  # Best batch size for time budget
 MATRIX_LR = 0.0005
 EMBEDDING_LR = 0.005
