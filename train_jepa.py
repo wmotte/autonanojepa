@@ -42,7 +42,7 @@ EMA_TAU = 0.999  # Slightly faster EMA target update
 VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 0.5
 VICREG_COV = 0.15       # Increased covariance regularization
-SUBEXPR_WEIGHT = 0.35   # Sub-expression auxiliary loss weight (Gap 2)
+SUBEXPR_WEIGHT = 0.4    # Sub-expression auxiliary loss weight (Gap 2)
 DEVICE_BATCH_SIZE = 26  # Adjusted for N_EMBD=168 to stay under 1GB
 MATRIX_LR = 0.0012
 EMBEDDING_LR = 0.012
