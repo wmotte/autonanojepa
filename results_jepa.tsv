@@ -33,3 +33,5 @@ b5e8c19	68.0104	1.2	keep	DEPTH=5, BS=24 (over 1GB)
 2807997	69.9610	0.9	keep	remove iterative refinement (NEW BEST!)
 7ae4c88	67.7503	1.0	keep	N_EMBD=168, no refinement (over 1GB)
 92c4f85	68.4005	0.9	keep	LR 0.002/0.02, no refinement
+0309259	68.0104	1.0	keep	N_EMBD=168, SUBEXPR_WEIGHT=0.35, BS=26
+c092349	67.8804	1.0	discard	SUBEXPR_WEIGHT=0.5, VICREG_GAMMA=0.6
