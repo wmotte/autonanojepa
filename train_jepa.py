@@ -35,15 +35,15 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # Hyperparameters (editable by autoresearch loop)
 # ---------------------------------------------------------------------------
 
-N_EMBD = 256
-DEPTH = 5
-N_HEAD = 4            # 256 // 4 = 64
+N_EMBD = 192
+DEPTH = 4
+N_HEAD = 3            # 192 // 3 = 64
 EMA_TAU = 0.999
 VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 0.5
 VICREG_COV = 0.1        # Covariance regularization weight (decorrelates z_ctx dims)
 SUBEXPR_WEIGHT = 0.25   # Sub-expression auxiliary loss weight (Gap 2)
-DEVICE_BATCH_SIZE = 48  # Reduced from 96 to fit memory
+DEVICE_BATCH_SIZE = 32  # Reduced to fit memory
 MATRIX_LR = 0.0005
 EMBEDDING_LR = 0.005
 WEIGHT_DECAY = 0.01
