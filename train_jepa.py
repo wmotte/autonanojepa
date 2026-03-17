@@ -35,15 +35,15 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # Hyperparameters (editable by autoresearch loop)
 # ---------------------------------------------------------------------------
 
-N_EMBD = 176
+N_EMBD = 160
 DEPTH = 4
-N_HEAD = 4            # 176 // 4 = 44 (even for RoPE)
+N_HEAD = 4            # 160 // 4 = 40 (even for RoPE)
 EMA_TAU = 0.9995  # Slower EMA target update
 VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 0.5
 VICREG_COV = 0.1        # Covariance regularization weight (decorrelates z_ctx dims)
 SUBEXPR_WEIGHT = 0.25   # Sub-expression auxiliary loss weight (Gap 2)
-DEVICE_BATCH_SIZE = 20  # Reduced for N_EMBD=176
+DEVICE_BATCH_SIZE = 28  # Best batch size for time budget
 MATRIX_LR = 0.001
 EMBEDDING_LR = 0.01
 WEIGHT_DECAY = 0.01
@@ -199,8 +199,6 @@ class NanoJEPA(nn.Module):
         self.pred_fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
         self.pred_fc2 = nn.Linear(4 * n_embd, 4 * n_embd, bias=False)
         self.pred_fc3 = nn.Linear(4 * n_embd, n_embd, bias=False)
-        # Iterative refinement (Gap 3): shared residual step applied 2x
-        self.refine_fc = nn.Linear(n_embd, n_embd, bias=False)
         # Reverse predictor: result → expr (symmetric JEPA)
         self.rev_pred_fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
         self.rev_pred_fc2 = nn.Linear(4 * n_embd, 4 * n_embd, bias=False)
@@ -213,10 +211,6 @@ class NanoJEPA(nn.Module):
         h = norm(mx.maximum(self.pred_fc1(z), 0))
         h = norm(mx.maximum(self.pred_fc2(h), 0))
         z_pred = self.pred_fc3(h)
-        # Gap 3: iterative refinement — 2 residual steps with shared weights.
-        # Simulates multi-step computation (e.g. reduce accumulation).
-        for _ in range(2):
-            z_pred = z_pred + self.refine_fc(norm(z_pred))
         return z_pred
 
     def predict_reverse(self, z):
