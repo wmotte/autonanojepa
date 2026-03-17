@@ -44,6 +44,8 @@ VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 0.5
 VICREG_COV = 0.15       # Increased covariance regularization
 SUBEXPR_WEIGHT = 0.4    # Sub-expression auxiliary loss weight (Gap 2)
+INFONCE_WEIGHT = 0.5    # In-batch InfoNCE contrastive loss weight
+INFONCE_TEMP   = 0.1    # Temperature (0.1 > 0.07 for stability at small batch=26)
 DEVICE_BATCH_SIZE = 26  # Adjusted for N_EMBD=168 to stay under 1GB
 MATRIX_LR = 0.0012
 EMBEDDING_LR = 0.012
@@ -384,12 +386,18 @@ def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask
     n_valid   = mx.maximum(mx.sum(has_span), 1.0)
     subexpr_loss = mx.sum((1.0 - span_cos) * has_span) / n_valid
 
+    # In-batch InfoNCE: z_pred[i] vs z_tgt[j] for all j (positive = i==j)
+    logits = mx.matmul(z_pred_n, mx.transpose(z_tgt_n)) / INFONCE_TEMP  # (B, B)
+    labels = mx.arange(logits.shape[0], dtype=mx.int32)
+    infonce_loss = mx.mean(nn.losses.cross_entropy(logits, labels))
+
     return (
         main_loss
         + 0.5 * rev_loss  # Symmetric JEPA weight
         + VICREG_LAMBDA * (var_pred_loss + var_ctx_loss)
         + VICREG_COV * cov_loss
         + SUBEXPR_WEIGHT * subexpr_loss
+        + INFONCE_WEIGHT * infonce_loss
     )
 
 

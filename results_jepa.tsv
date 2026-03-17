@@ -2,3 +2,4 @@ commit	val_recall_at_1	memory_gb	status	description
 806bc52	86.6505	1.0	keep	baseline: execution prediction task (GELU predictor, N_EMBD=168, BS=26)
 e994d63	87.6214	1.0	keep	attention pooling (learned D→1 query replaces mean pool)
 f332c8d	89.3204	1.0	keep	EMA tau cosine schedule (0.996→0.9999, I-JEPA style)
+028dc42	90.7767	1.0	keep	in-batch InfoNCE contrastive loss (T=0.1, weight=0.5)
