@@ -1,54 +1,41 @@
-# Plan: Attention Pooling to Replace Mean Pooling
+# Plan: EMA Tau Cosine Schedule (I-JEPA style)
 
 ## 1. Idea
 
-Replace the mean-pooling aggregation in `ClojureEncoder` with a learned attention-pooling layer.
-Currently, all non-padding tokens receive equal weight when computing the expression embedding:
+Replace the fixed `EMA_TAU = 0.999` with a cosine ramp from `TAU_START = 0.996` to
+`TAU_END = 0.9999` over the training budget:
 
-```python
-return mx.sum(x * mask_f, axis=1) / denom  # (B, n_embd)
+```
+tau(t) = TAU_END - (TAU_END - TAU_START) * (cos(π * progress) + 1) / 2
 ```
 
-The change: add a single linear projection `D → 1` that scores each token position; apply
-softmax over non-padding positions to get per-token weights; then take a weighted sum.
-This lets the model learn that **operators and function names** (`+`, `map`, `reduce`, at
-position 2 right after BOS) carry more semantic content for execution prediction than
-structural bracket tokens (`(`, `)`, `[`, `]`), which are currently counted equally.
-
-The pooling layer adds exactly `N_EMBD = 168` parameters. It is applied in both
-`__call__` and `encode_full` so that the sub-expression auxiliary loss also benefits.
+At `progress=0`: `tau = 0.996` (faster EMA, target tracks context encoder quickly).
+At `progress=1`: `tau = 0.9999` (slow EMA, stable target for precise alignment).
 
 ## 2. Not Low-Hanging Fruit — Justification
 
-- **Not a hyperparameter sweep.** Changes the aggregation function itself, not a scalar coefficient.
-- **Not scaling.** Adds only 168 parameters out of ~2.1M — negligible size increase.
-- **Not a copy of anything tried.** Mean-pooling has been unchanged since project start.
-- **Mechanistic novelty.** Clojure expressions have highly non-uniform token importance:
-  the operator at position 2 determines the computation type entirely, while brackets are
-  structural scaffolding. Mean-pooling conflates both. Attention pooling can learn a prior
-  over token roles that mean-pooling cannot express. This is structurally different from the
-  depth embedding (which only adds a positional bias, not a weighting).
+- **Not a hyperparameter sweep.** Changes the *shape* of the EMA schedule (constant → cosine
+  curve), not just its final value. A sweep over fixed tau values would not discover that
+  a schedule outperforms any constant.
+- **Not scaling.** Zero additional parameters or compute.
+- **Not a copy of prior experiments.** All previous runs used fixed tau.
+- **Mechanistic novelty.** Our target encoder is intentionally initialised independently
+  (different random state from the context encoder). Early in training, the target encodes
+  random noise — a fixed high tau (0.999) means it takes ~1000 steps to move appreciably,
+  wasting early training budget on a meaningless prediction target. A lower starting tau
+  (0.996) makes the target converge ~4× faster in expectation, compressing the noisy
+  bootstrap phase. As training stabilises, a higher tau is needed to prevent the target
+  from chasing the still-learning context encoder too aggressively.
 
 ## 3. Evidence / References
 
-- **Sentence-BERT** (Reimers & Gurevych, 2019): compared mean-pool, max-pool, and CLS-token
-  pooling across BERT tasks. Mean pooling performs well on symmetric tasks but is outperformed
-  by attention-based pooling on asymmetric sequence-to-property tasks — directly analogous
-  to expression → result.
-
-- **ESM-2 / ProtTrans** protein language models: attention-weighted pooling over residue
-  representations outperforms mean pooling for sequence-level property prediction, an
-  analogous "map variable-length sequence → compact embedding" task.
-
-- **Code embedding literature** (CodeBERT, GraphCodeBERT): mean pooling over code tokens
-  has been shown to dilute semantic signal with structural noise; token-level attention
-  pooling or [CLS]-token extraction is preferred in downstream retrieval tasks.
-
-- **Known failure mode:** attention weights can collapse onto a single token, degrading to
-  argmax pooling. The existing VICReg variance regularisation on `z_ctx` provides implicit
-  protection since collapsed pooling would reduce variance across the batch — VICReg would
-  penalise this.
-
-- Web search found no direct prior art applying attention pooling specifically to JEPA-style
-  execution prediction, but the above analogues from NLP and protein modeling justify
-  the hypothesis that attention pooling should strictly dominate mean pooling here.
+- **I-JEPA** (Assran et al., 2023): explicitly uses cosine tau schedule from 0.996 → 0.9999.
+  Ablations show fixed tau performs worse; the schedule is highlighted as a key design choice.
+- **BYOL** (Grill et al., 2020): uses a cosine schedule from 0.996 → 1.0. Authors note
+  that the schedule "provides implicit curriculum" and that fixed tau at 0.996 causes
+  representation collapse in some configurations.
+- **MoCo v3** (Chen et al., 2021): uses fixed tau=0.99 but notes that lower tau values
+  help early convergence; later work moved to schedules.
+- Known failure mode: if TAU_START is too low (e.g. 0.9), the target encoder tracks the
+  context encoder so closely it collapses to a trivial solution. 0.996 is the value used
+  in I-JEPA, where it was empirically validated.
