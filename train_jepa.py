@@ -154,14 +154,30 @@ class EncoderBlock(nn.Module):
         return x
 
 
+class AttentionPool(nn.Module):
+    """Learned attention pooling: D→1 linear scores each token; softmax over non-padding."""
+
+    def __init__(self, n_embd):
+        super().__init__()
+        self.score = nn.Linear(n_embd, 1, bias=False)
+
+    def __call__(self, x, mask):
+        # x: (B, T, D), mask: (B, T) float 0/1
+        scores = self.score(x).squeeze(-1)            # (B, T)
+        scores = scores + (1.0 - mask) * -1e9         # mask out padding
+        weights = mx.softmax(scores, axis=-1)         # (B, T)
+        return mx.sum(x * weights[..., None], axis=1) # (B, D)
+
+
 class ClojureEncoder(nn.Module):
-    """Bidirectional transformer encoder with mean-pooling over non-pad tokens."""
+    """Bidirectional transformer encoder with attention-pooling over non-pad tokens."""
 
     def __init__(self, vocab_size, n_embd, n_layer, n_head):
         super().__init__()
         self.wte = nn.Embedding(vocab_size, n_embd)
         self.depth_emb = DepthEmbedding(MAX_DEPTH, n_embd)  # Gap 1
         self.blocks = [EncoderBlock(n_embd, n_head) for _ in range(n_layer)]
+        self.pool = AttentionPool(n_embd)
 
     def _run_transformer(self, tokens):
         """Full transformer pass; returns per-token hidden states (B, T, D)."""
@@ -174,18 +190,14 @@ class ClojureEncoder(nn.Module):
     def __call__(self, tokens, mask):
         # tokens: (B, T), mask: (B, T) float 0/1
         x = self._run_transformer(tokens)
-        mask_f = mask.astype(mx.float32)[..., None]  # (B, T, 1)
-        denom = mx.maximum(mx.sum(mask_f, axis=1), 1.0)
-        return mx.sum(x * mask_f, axis=1) / denom  # (B, n_embd)
+        return self.pool(x, mask.astype(mx.float32))
 
     def encode_full(self, tokens, mask):
         """Returns (z, hidden): pooled embedding + per-token hidden states (B, T, D).
         Used by sub-expression auxiliary loss (Gap 2).
         """
         x = self._run_transformer(tokens)
-        mask_f = mask.astype(mx.float32)[..., None]
-        denom = mx.maximum(mx.sum(mask_f, axis=1), 1.0)
-        z = mx.sum(x * mask_f, axis=1) / denom
+        z = self.pool(x, mask.astype(mx.float32))
         return z, x
 
 

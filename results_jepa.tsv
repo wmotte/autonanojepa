@@ -1,2 +1,3 @@
 commit	val_recall_at_1	memory_gb	status	description
 806bc52	86.6505	1.0	keep	baseline: execution prediction task (GELU predictor, N_EMBD=168, BS=26)
+e994d63	87.6214	1.0	keep	attention pooling (learned D→1 query replaces mean pool)
