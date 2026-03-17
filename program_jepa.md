@@ -83,8 +83,38 @@ Branch: `main` — commit all changes directly to main.
 
 LOOP FOREVER:
 
+### Step 0 — Plan before you code (MANDATORY)
+
+Before touching `train_jepa.py`, write `plan.md` with the following three sections:
+
+**1. Idea**
+State the proposed change in one paragraph. Be specific about what you will modify and why you expect it to help.
+
+**2. Not low-hanging fruit — justify this**
+Explicitly argue why this idea is *not* one of the following boring moves:
+- Trivial hyperparameter sweep (LR, BS, depth, width, dropout, weight decay)
+- Obvious scaling (bigger model, more steps, more data)
+- Direct copy of a setting already tried in `results_jepa.tsv`
+- Generic "let's try X" with no mechanistic reasoning
+
+Your argument must reference *why* the idea is mechanistically novel, structurally different, or borrowed from a different domain in a non-obvious way. If you cannot write two sentences defending this, pick a different idea.
+
+**3. Evidence / references**
+Search the internet if you need to. Look for:
+- Papers or blog posts describing this technique in another domain (NLP, vision, RL, audio, protein folding, etc.)
+- Known failure modes or success conditions for this idea
+- Prior art in JEPA, BYOL, SimCLR, VICReg, I-JEPA, or related self-supervised methods
+
+Summarize what you found in 2–5 bullet points. If a web search turns up nothing useful, say so explicitly and explain why you still think the idea is worth trying.
+
+Commit `plan.md` separately: `git add plan.md && git commit -m "plan: <idea title>"`
+
+---
+
+### Step 1–9 — Execute
+
 1. Check git state: `git status` — confirm you are on `main`.
-2. Modify `train_jepa.py` with an experimental idea.
+2. Modify `train_jepa.py` with the idea from `plan.md`.
 3. `git add train_jepa.py && git commit -m "experiment: <description>"`
 4. Run: `uv run train_jepa.py > run.log 2>&1`
 5. Check: `grep "^val_recall_at_1_pct:\|^val_mean_cos:\|^peak_vram_mb:" run.log`
@@ -95,4 +125,4 @@ LOOP FOREVER:
 
 **Timeout**: ~2 min per experiment (TIME_BUDGET=60s + eval). Kill and discard if >5 min.
 
-**NEVER STOP**: Run autonomously until manually interrupted. If out of ideas, think harder.
+**NEVER STOP**: Run autonomously until manually interrupted. If out of ideas, search the web for recent self-supervised learning tricks and think harder.

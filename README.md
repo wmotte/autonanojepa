@@ -356,7 +356,8 @@ The target encoder is updated only through the EMA — it never receives gradien
 |---|---|---|
 | `prepare_jepa.py` | Vocab, generator, eval cache, dataloader | **Fixed** — do not modify (autoresearch loop) |
 | `train_jepa.py` | Model, loss, optimizer, training loop | **Yes** — autoresearch target |
-| `program_jepa.md` | Autoresearch loop protocol | Reference |
+| `program_jepa.md` | Autoresearch loop protocol (includes planning step) | Reference |
+| `plan.md` | Per-experiment plan written before each code change | Generated per run |
 | `results_jepa.tsv` | Experiment log | Append-only |
 | `README.md` | This file | Reference |
 
@@ -412,17 +413,12 @@ The rise-then-plateau pattern is expected JEPA behaviour: the EMA target encoder
 
 See `program_jepa.md` for the full protocol. In short:
 
+0. **Plan** — write `plan.md` with the idea, a justification that it is not a trivial hyperparameter sweep, and evidence from a web search or prior literature. Commit `plan.md` before touching `train_jepa.py`.
 1. Stay on `main` — all commits go directly to main
-2. Edit `train_jepa.py` (hyperparameters at the top, or deeper architectural changes)
+2. Edit `train_jepa.py` with the planned idea
 3. Commit → run → grep → log → keep/discard
 
-Things worth trying:
-- Larger encoder (N_EMBD=512, DEPTH=6)
-- Stronger VICReg (higher VICREG_LAMBDA or VICREG_COV)
-- Lower EMA tau (faster target drift, e.g. τ=0.99)
-- Batch size sweep (64 → 128 → 256)
-- Separate encoder for expressions vs. results (asymmetric JEPA)
-- Recall@5 or MRR as secondary metrics
+The planning step is mandatory. Ideas that are pure hyperparameter sweeps or obvious scaling moves are explicitly discouraged; the agent is expected to search the web for techniques from other domains (NLP, vision, RL, protein folding, etc.) and argue mechanistically why each idea is worth trying.
 
 ---
 
