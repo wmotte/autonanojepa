@@ -208,8 +208,8 @@ class NanoJEPA(nn.Module):
         self.subexpr_fc2 = nn.Linear(2 * n_embd, n_embd, bias=False)
 
     def predict(self, z):
-        h = norm(mx.maximum(self.pred_fc1(z), 0))
-        h = norm(mx.maximum(self.pred_fc2(h), 0))
+        h = norm(nn.gelu(self.pred_fc1(z)))
+        h = norm(nn.gelu(self.pred_fc2(h)))
         z_pred = self.pred_fc3(h)
         return z_pred
 
