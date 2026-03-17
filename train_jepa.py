@@ -35,20 +35,20 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # Hyperparameters (editable by autoresearch loop)
 # ---------------------------------------------------------------------------
 
-N_EMBD = 160
-DEPTH = 5
-N_HEAD = 4            # 160 // 4 = 40 (even for RoPE)
+N_EMBD = 168
+DEPTH = 4
+N_HEAD = 4            # 168 // 4 = 42 (even for RoPE)
 EMA_TAU = 0.9995  # Slower EMA target update
 VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 0.5
 VICREG_COV = 0.1        # Covariance regularization weight (decorrelates z_ctx dims)
 SUBEXPR_WEIGHT = 0.25   # Sub-expression auxiliary loss weight (Gap 2)
-DEVICE_BATCH_SIZE = 24  # Reduced for DEPTH=5
+DEVICE_BATCH_SIZE = 24  # For N_EMBD=168
 MATRIX_LR = 0.001
 EMBEDDING_LR = 0.01
 WEIGHT_DECAY = 0.01
-WARMUP_RATIO = 0.1   # Increased from 0.05
-WARMDOWN_RATIO = 0.4  # Cosine decay over final 40%
+WARMUP_RATIO = 0.05
+WARMDOWN_RATIO = 0.4
 
 # ---------------------------------------------------------------------------
 # Utilities (copied from train.py)
