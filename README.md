@@ -289,7 +289,7 @@ uv run prepare_jepa.py
 uv run train_jepa.py
 ```
 
-No data downloads. No internet access required after setup. The validation set is deterministic (seed=12345) and cached at `~/.cache/autoresearch_jepa/val_pairs_v5.npz`.
+No data downloads. No internet access required after setup. The validation set is deterministic (seed=12345) and cached at `data/val_pairs.txt`.
 
 ### Sample training pairs
 

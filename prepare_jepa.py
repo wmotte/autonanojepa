@@ -23,8 +23,8 @@ MAX_RESULT_LEN = 8
 TIME_BUDGET = 120
 N_VAL_PAIRS = 2000
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch_jepa")
-VAL_CACHE_PATH = os.path.join(CACHE_DIR, "val_pairs_v5.npz")
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+VAL_CACHE_PATH = os.path.join(CACHE_DIR, "val_pairs.txt")
 
 # ---------------------------------------------------------------------------
 # Vocabulary
@@ -786,11 +786,19 @@ def load_val_pairs():
     """Load cached 2000 validation pairs. Generates and caches on first call.
     Returns (expr, expr_mask, res, res_mask, mask_len).
     mask_len is the number of tokens masked per pair (1/2/3).
+
+    Format: plain text, 2000 rows x 81 columns (int32).
+    Columns: expr[32] | expr_mask[32] | res[8] | res_mask[8] | mask_len[1]
     """
     if not os.path.exists(VAL_CACHE_PATH):
         _generate_val_cache()
-    data = np.load(VAL_CACHE_PATH)
-    return data["expr"], data["expr_mask"], data["res"], data["res_mask"], data["mask_len"]
+    data = np.loadtxt(VAL_CACHE_PATH, dtype=np.int32)
+    expr      = data[:, :MAX_EXPR_LEN]
+    expr_mask = data[:, MAX_EXPR_LEN:2 * MAX_EXPR_LEN]
+    res       = data[:, 2 * MAX_EXPR_LEN:2 * MAX_EXPR_LEN + MAX_RESULT_LEN]
+    res_mask  = data[:, 2 * MAX_EXPR_LEN + MAX_RESULT_LEN:2 * MAX_EXPR_LEN + 2 * MAX_RESULT_LEN]
+    mask_len  = data[:, -1]
+    return expr, expr_mask, res, res_mask, mask_len
 
 
 def _generate_val_cache():
@@ -806,14 +814,14 @@ def _generate_val_cache():
         ress.append(r)
         res_masks.append(rm)
         mask_lens.append(span_len)
-    np.savez(
-        VAL_CACHE_PATH,
-        expr=np.stack(exprs),
-        expr_mask=np.stack(expr_masks),
-        res=np.stack(ress),
-        res_mask=np.stack(res_masks),
-        mask_len=np.array(mask_lens, dtype=np.int32),
-    )
+    data = np.concatenate([
+        np.stack(exprs),
+        np.stack(expr_masks),
+        np.stack(ress),
+        np.stack(res_masks),
+        np.array(mask_lens, dtype=np.int32)[:, None],
+    ], axis=1)
+    np.savetxt(VAL_CACHE_PATH, data, fmt="%d")
     print(f"2000 val pairs cached to {VAL_CACHE_PATH}")
 
 

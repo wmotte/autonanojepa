@@ -20,13 +20,14 @@ from mlx.utils import tree_flatten, tree_map
 from prepare_jepa import (
     MAX_EXPR_LEN,
     MAX_RESULT_LEN,
-    TIME_BUDGET,
     VOCAB_SIZE,
     BOS_ID,
     ClojureVocab,
     load_val_pairs,
     make_jepa_dataloader,
 )
+
+TIME_BUDGET = 60  # reduced from 120s — model already saturates at 120s
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
@@ -41,6 +42,7 @@ EMA_TAU = 0.999
 VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 0.5
 VICREG_COV = 0.1        # Covariance regularization weight (decorrelates z_ctx dims)
+SUBEXPR_WEIGHT = 0.25   # Sub-expression auxiliary loss weight (Gap 2)
 DEVICE_BATCH_SIZE = 96
 MATRIX_LR = 0.0005
 EMBEDDING_LR = 0.005
@@ -59,6 +61,39 @@ def norm(x):
 
 def get_peak_memory_mb():
     return mx.get_peak_memory() / 1024 / 1024
+
+
+# ---------------------------------------------------------------------------
+# Depth embedding (Gap 1: structural bias)
+# ---------------------------------------------------------------------------
+
+MAX_DEPTH = 8  # Maximum nesting depth tracked (vocab rarely exceeds 5)
+
+
+class DepthEmbedding(nn.Module):
+    """Encodes syntactic nesting depth for each token position.
+
+    For `( + ( count [ 1 2 ] ) 2 )`:
+      depth:  0  1   1  2    2 2 2  1  1  1  0
+    Forces attention heads to distinguish tokens at different scoping levels.
+    Token IDs: ( = 4, ) = 5, [ = 6, ] = 7, { = 8, } = 9  (from ClojureVocab)
+    """
+
+    def __init__(self, max_depth, n_embd):
+        super().__init__()
+        self.emb = nn.Embedding(max_depth + 1, n_embd)
+        self.max_depth = max_depth
+
+    def __call__(self, tokens):
+        # tokens: (B, T) int32
+        is_open  = ((tokens == 4) | (tokens == 6) | (tokens == 8)).astype(mx.int32)
+        is_close = ((tokens == 5) | (tokens == 7) | (tokens == 9)).astype(mx.int32)
+        delta = is_open - is_close
+        cum   = mx.cumsum(delta, axis=-1)
+        # depth[t] = sum of deltas *before* position t = cum[t] - delta[t]
+        depth = mx.maximum(cum - delta, 0)
+        depth = mx.minimum(depth, self.max_depth)
+        return self.emb(depth)
 
 
 # ---------------------------------------------------------------------------
@@ -125,20 +160,33 @@ class ClojureEncoder(nn.Module):
     def __init__(self, vocab_size, n_embd, n_layer, n_head):
         super().__init__()
         self.wte = nn.Embedding(vocab_size, n_embd)
+        self.depth_emb = DepthEmbedding(MAX_DEPTH, n_embd)  # Gap 1
         self.blocks = [EncoderBlock(n_embd, n_head) for _ in range(n_layer)]
 
-    def __call__(self, tokens, mask):
-        # tokens: (B, T), mask: (B, T) float 0/1
-        x = self.wte(tokens)
+    def _run_transformer(self, tokens):
+        """Full transformer pass; returns per-token hidden states (B, T, D)."""
+        x = self.wte(tokens) + self.depth_emb(tokens)  # Gap 1: depth signal
         x = norm(x)
         for block in self.blocks:
             x = block(x)
-        x = norm(x)
-        # Mean pool over non-pad positions
+        return norm(x)
+
+    def __call__(self, tokens, mask):
+        # tokens: (B, T), mask: (B, T) float 0/1
+        x = self._run_transformer(tokens)
         mask_f = mask.astype(mx.float32)[..., None]  # (B, T, 1)
         denom = mx.maximum(mx.sum(mask_f, axis=1), 1.0)
-        z = mx.sum(x * mask_f, axis=1) / denom  # (B, n_embd)
-        return z
+        return mx.sum(x * mask_f, axis=1) / denom  # (B, n_embd)
+
+    def encode_full(self, tokens, mask):
+        """Returns (z, hidden): pooled embedding + per-token hidden states (B, T, D).
+        Used by sub-expression auxiliary loss (Gap 2).
+        """
+        x = self._run_transformer(tokens)
+        mask_f = mask.astype(mx.float32)[..., None]
+        denom = mx.maximum(mx.sum(mask_f, axis=1), 1.0)
+        z = mx.sum(x * mask_f, axis=1) / denom
+        return z, x
 
 
 class NanoJEPA(nn.Module):
@@ -151,21 +199,36 @@ class NanoJEPA(nn.Module):
         self.pred_fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
         self.pred_fc2 = nn.Linear(4 * n_embd, 4 * n_embd, bias=False)
         self.pred_fc3 = nn.Linear(4 * n_embd, n_embd, bias=False)
+        # Iterative refinement (Gap 3): shared residual step applied 2x
+        self.refine_fc = nn.Linear(n_embd, n_embd, bias=False)
         # Reverse predictor: result → expr (symmetric JEPA)
         self.rev_pred_fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
         self.rev_pred_fc2 = nn.Linear(4 * n_embd, 4 * n_embd, bias=False)
         self.rev_pred_fc3 = nn.Linear(4 * n_embd, n_embd, bias=False)
+        # Sub-expression predictor (Gap 2): hidden-at-root → span embedding
+        self.subexpr_fc1 = nn.Linear(n_embd, 2 * n_embd, bias=False)
+        self.subexpr_fc2 = nn.Linear(2 * n_embd, n_embd, bias=False)
 
     def predict(self, z):
         h = norm(mx.maximum(self.pred_fc1(z), 0))
         h = norm(mx.maximum(self.pred_fc2(h), 0))
-        return self.pred_fc3(h)
+        z_pred = self.pred_fc3(h)
+        # Gap 3: iterative refinement — 2 residual steps with shared weights.
+        # Simulates multi-step computation (e.g. reduce accumulation).
+        for _ in range(2):
+            z_pred = z_pred + self.refine_fc(norm(z_pred))
+        return z_pred
 
     def predict_reverse(self, z):
         """Reverse predictor: predict expression embedding from result embedding."""
         h = norm(mx.maximum(self.rev_pred_fc1(z), 0))
         h = norm(mx.maximum(self.rev_pred_fc2(h), 0))
         return self.rev_pred_fc3(h)
+
+    def predict_subexpr(self, z_span_root):
+        """Gap 2: predict sub-expression embedding from its root hidden state."""
+        h = norm(mx.maximum(self.subexpr_fc1(z_span_root), 0))
+        return self.subexpr_fc2(h)
 
     def __call__(self, expr_tokens, expr_mask):
         z_ctx = self.ctx_encoder(expr_tokens, expr_mask)
@@ -207,12 +270,61 @@ def _set_nested(obj, path, value):
 
 
 # ---------------------------------------------------------------------------
+# Sub-expression span extraction (Gap 2: compositional generalization)
+# ---------------------------------------------------------------------------
+
+_OPEN_IDS  = {4, 6, 8}  # (, [, {  (token IDs from ClojureVocab)
+_CLOSE_IDS = {5, 7, 9}  # ), ], }
+
+
+def compute_span_info(expr_np, expr_mask_np):
+    """CPU-side bracket matching: sample one sub-expression span per batch item.
+
+    Returns:
+      span_starts : (B,) int32  — start index of sampled span (-1 if none found)
+      span_mask   : (B, T) float32 — 1.0 within sampled span, 0.0 elsewhere
+
+    Only non-root spans (start > 1, skipping BOS + outer paren) of length ≥ 3
+    are considered, so simple flat expressions yield no span (start stays -1).
+    """
+    B, T = expr_np.shape
+    span_starts = np.full(B, -1, dtype=np.int32)
+    span_mask   = np.zeros((B, T), dtype=np.float32)
+
+    for b in range(B):
+        toks  = expr_np[b]
+        spans = []
+        stack = []
+        for t in range(T):
+            tok = int(toks[t])
+            if tok in _OPEN_IDS:
+                stack.append(t)
+            elif tok in _CLOSE_IDS and stack:
+                start = stack.pop()
+                end   = t + 1           # exclusive
+                # start > 1: skip outermost ( at position 1 (right after BOS)
+                if end - start >= 3 and start > 1:
+                    spans.append((start, end))
+
+        if spans:
+            i = np.random.randint(len(spans))
+            start, end = spans[i]
+            span_starts[b] = start
+            # Intersect with expression mask so PAD positions stay 0
+            span_mask[b, start:end] = expr_mask_np[b, start:end]
+
+    return span_starts, span_mask
+
+
+# ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
 
 
-def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask):
-    z_ctx = model.ctx_encoder(expr_tokens, expr_mask)
+def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask,
+                 span_starts, span_mask):
+    # Gap 2: encode_full returns per-token hidden states needed for subexpr loss
+    z_ctx, hidden_ctx = model.ctx_encoder.encode_full(expr_tokens, expr_mask)
     z_pred = model.predict(z_ctx)
     z_tgt = mx.stop_gradient(target_enc(res_tokens, res_mask))
 
@@ -248,11 +360,29 @@ def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask
     rev_cos_sim = mx.sum(z_rev_pred_n * z_ctx_n, axis=-1)
     rev_loss = 1.0 - mx.mean(rev_cos_sim)
 
+    # Gap 2: sub-expression auxiliary loss.
+    # Target: target encoder mean-pooled over the sampled span positions.
+    # Prediction: from the hidden state at the span's opening bracket.
+    # This forces each ( hidden state to encode what its sub-expression means.
+    B = expr_tokens.shape[0]
+    z_span_tgt = mx.stop_gradient(target_enc(expr_tokens, span_mask))
+    clamped_starts = mx.maximum(span_starts, 0)          # clamp -1 → 0 (masked out below)
+    z_span_root = hidden_ctx[mx.arange(B), clamped_starts]  # (B, D)
+    z_span_pred = model.predict_subexpr(z_span_root)
+
+    z_span_tgt_n  = z_span_tgt  * mx.rsqrt(mx.sum(z_span_tgt  * z_span_tgt,  axis=-1, keepdims=True) + 1e-8)
+    z_span_pred_n = z_span_pred * mx.rsqrt(mx.sum(z_span_pred * z_span_pred, axis=-1, keepdims=True) + 1e-8)
+    span_cos  = mx.sum(z_span_tgt_n * z_span_pred_n, axis=-1)   # (B,)
+    has_span  = (span_starts >= 0).astype(mx.float32)            # (B,)
+    n_valid   = mx.maximum(mx.sum(has_span), 1.0)
+    subexpr_loss = mx.sum((1.0 - span_cos) * has_span) / n_valid
+
     return (
         main_loss
         + 0.5 * rev_loss  # Symmetric JEPA weight
         + VICREG_LAMBDA * (var_pred_loss + var_ctx_loss)
         + VICREG_COV * cov_loss
+        + SUBEXPR_WEIGHT * subexpr_loss
     )
 
 
@@ -340,6 +470,77 @@ class AdamW:
 
 
 # ---------------------------------------------------------------------------
+# Evaluation helpers
+# ---------------------------------------------------------------------------
+
+
+def _val_span_info(expr_np, expr_mask_np):
+    """Deterministic span extraction for validation: first innermost closed span.
+
+    Unlike compute_span_info (random), this always picks the first span whose
+    closing bracket appears earliest — i.e. the shallowest innermost sub-expression.
+    Returns span_starts (B,) int32 and span_masks (B, T) float32.
+    """
+    B, T = expr_np.shape
+    span_starts = np.full(B, -1, dtype=np.int32)
+    span_masks  = np.zeros((B, T), dtype=np.float32)
+    for b in range(B):
+        toks  = expr_np[b]
+        stack = []
+        for t in range(T):
+            tok = int(toks[t])
+            if tok in _OPEN_IDS:
+                stack.append(t)
+            elif tok in _CLOSE_IDS and stack:
+                start = stack.pop()
+                end   = t + 1
+                if end - start >= 3 and start > 1:
+                    span_starts[b] = start
+                    span_masks[b, start:end] = expr_mask_np[b, start:end]
+                    break  # first valid innermost span only
+    return span_starts, span_masks
+
+
+def _evaluate_subexpr_cos(model, target_enc, expr, expr_mask, batch_size=256):
+    """Cosine similarity for sub-expression prediction head (Gap 2).
+
+    For each val item with a valid interior span, tests whether
+    predict_subexpr(hidden_at_open_bracket) ≈ target_enc(span_tokens).
+    Returns mean cosine over val items that have a sub-expression.
+    """
+    span_starts_np, span_masks_np = _val_span_info(expr, expr_mask)
+    N = len(expr)
+    total_cos = 0.0
+    total_n   = 0
+
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        e   = mx.array(expr[start:end],         dtype=mx.int32)
+        em  = mx.array(expr_mask[start:end],    dtype=mx.float32)
+        ss  = mx.array(span_starts_np[start:end], dtype=mx.int32)
+        smk = mx.array(span_masks_np[start:end],  dtype=mx.float32)
+
+        _, hidden   = model.ctx_encoder.encode_full(e, em)
+        z_span_tgt  = mx.stop_gradient(target_enc(e, smk))
+        clamped     = mx.maximum(ss, 0)
+        B           = e.shape[0]
+        z_span_root = hidden[mx.arange(B), clamped]         # (B, D)
+        z_span_pred = model.predict_subexpr(z_span_root)
+
+        z_tgt_n  = z_span_tgt  * mx.rsqrt(mx.sum(z_span_tgt  * z_span_tgt,  axis=-1, keepdims=True) + 1e-8)
+        z_pred_n = z_span_pred * mx.rsqrt(mx.sum(z_span_pred * z_span_pred, axis=-1, keepdims=True) + 1e-8)
+        cos = mx.sum(z_tgt_n * z_pred_n, axis=-1)  # (B,)
+        mx.eval(cos)
+
+        cos_np_b = np.array(cos)
+        has      = span_starts_np[start:end] >= 0
+        total_cos += float(cos_np_b[has].sum()) if has.any() else 0.0
+        total_n   += int(has.sum())
+
+    return total_cos / total_n if total_n > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -347,10 +548,11 @@ class AdamW:
 def evaluate_val_retrieval(model, target_enc, batch_size=256):
     """Evaluate on 2000 masked-JEPA val pairs.
 
-    Returns (val_mean_cos, val_class_acc):
-      - val_mean_cos:   mean cosine similarity between predicted and target embeddings.
-      - val_class_acc:  token-level accuracy on single-token mask pairs (nearest neighbour
-                        over all 96 vocab tokens). Random baseline = 1/96 ≈ 1%.
+    Returns (val_mean_cos, val_class_acc, cos_by_masklen, val_subexpr_cos):
+      - val_mean_cos:    mean cosine similarity (all pairs)
+      - val_class_acc:   nearest-neighbour token accuracy on mask_len==1 pairs
+      - cos_by_masklen:  {1: float, 2: float, 3: float} cosine by mask length
+      - val_subexpr_cos: cosine for sub-expression prediction head (Gap 2)
     """
     expr, expr_mask, res, res_mask, mask_len = load_val_pairs()
     N = len(expr)
@@ -375,7 +577,16 @@ def evaluate_val_retrieval(model, target_enc, batch_size=256):
         cos_sims.append(cos_sim)
         all_z_pred.append(z_pred_n)
 
-    mean_cos = float(mx.mean(mx.concatenate(cos_sims, axis=0)).item())
+    cos_all = mx.concatenate(cos_sims, axis=0)  # (N,)
+    mx.eval(cos_all)
+    cos_np   = np.array(cos_all)
+    mean_cos = float(np.mean(cos_np))
+
+    # --- Cosine breakdown by mask length (1 / 2 / 3 tokens masked) ---
+    cos_by_masklen = {}
+    for ml in [1, 2, 3]:
+        idx = np.where(mask_len == ml)[0]
+        cos_by_masklen[ml] = float(np.mean(cos_np[idx])) if len(idx) > 0 else 0.0
 
     # --- Class accuracy on single-token mask pairs ---
     # Build one prototype embedding per vocab token: target_enc([BOS, tok, PAD...], [1,1,0...])
@@ -392,14 +603,17 @@ def evaluate_val_retrieval(model, target_enc, batch_size=256):
     single_idx = np.where(mask_len == 1)[0]
     class_acc = 0.0
     if len(single_idx) > 0:
-        z_pred_all = mx.concatenate(all_z_pred, axis=0)          # (N, D)
-        z_single = z_pred_all[mx.array(single_idx, dtype=mx.int32)]  # (M, D)
-        sims = mx.matmul(z_single, mx.transpose(z_proto_n))          # (M, 96)
-        pred_toks = mx.argmax(sims, axis=1)                          # (M,)
-        true_toks = mx.array(res[single_idx, 1], dtype=mx.int32)     # token after BOS
-        class_acc = float(mx.mean((pred_toks == true_toks).astype(mx.float32)).item())
+        z_pred_all = mx.concatenate(all_z_pred, axis=0)             # (N, D)
+        z_single   = z_pred_all[mx.array(single_idx, dtype=mx.int32)]  # (M, D)
+        sims       = mx.matmul(z_single, mx.transpose(z_proto_n))   # (M, 96)
+        pred_toks  = mx.argmax(sims, axis=1)                        # (M,)
+        true_toks  = mx.array(res[single_idx, 1], dtype=mx.int32)   # token after BOS
+        class_acc  = float(mx.mean((pred_toks == true_toks).astype(mx.float32)).item())
 
-    return mean_cos, class_acc
+    # --- Sub-expression prediction (Gap 2) ---
+    val_subexpr_cos = _evaluate_subexpr_cos(model, target_enc, expr, expr_mask, batch_size)
+
+    return mean_cos, class_acc, cos_by_masklen, val_subexpr_cos
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +646,10 @@ print(f"Target encoder params (EMA only): {num_target_params / 1e6:.2f}M")
 
 optimizer = AdamW(model, matrix_lr=MATRIX_LR, embedding_lr=EMBEDDING_LR, weight_decay=WEIGHT_DECAY)
 
-loss_grad_fn = nn.value_and_grad(model, lambda m, et, em, rt, rm: compute_loss(m, target_enc, et, em, rt, rm))
+loss_grad_fn = nn.value_and_grad(
+    model,
+    lambda m, et, em, rt, rm, ss, smk: compute_loss(m, target_enc, et, em, rt, rm, ss, smk),
+)
 
 print(f"Time budget: {TIME_BUDGET}s")
 
@@ -446,12 +663,17 @@ while True:
     t0 = time.time()
 
     expr_np, expr_mask_np, res_np, res_mask_np = next(train_loader)
+    # Gap 2: bracket matching on CPU before sending to GPU
+    span_starts_np, span_mask_np = compute_span_info(expr_np, expr_mask_np)
+
     expr_t = mx.array(expr_np, dtype=mx.int32)
     expr_m = mx.array(expr_mask_np, dtype=mx.float32)
-    res_t = mx.array(res_np, dtype=mx.int32)
-    res_m = mx.array(res_mask_np, dtype=mx.float32)
+    res_t  = mx.array(res_np, dtype=mx.int32)
+    res_m  = mx.array(res_mask_np, dtype=mx.float32)
+    span_starts_t = mx.array(span_starts_np, dtype=mx.int32)
+    span_mask_t   = mx.array(span_mask_np,   dtype=mx.float32)
 
-    loss, grads = loss_grad_fn(model, expr_t, expr_m, res_t, res_m)
+    loss, grads = loss_grad_fn(model, expr_t, expr_m, res_t, res_m, span_starts_t, span_mask_t)
     mx.eval(loss, grads)
 
     if t_compiled is None:
@@ -521,7 +743,7 @@ t_train = time.time()
 print(f"Training completed in {t_train - (t_compiled or t_start):.1f}s")
 
 print("Starting final eval...")
-val_mean_cos, val_class_acc = evaluate_val_retrieval(model, target_enc)
+val_mean_cos, val_class_acc, cos_by_masklen, val_subexpr_cos = evaluate_val_retrieval(model, target_enc)
 t_eval = time.time()
 print(f"Final eval completed in {t_eval - t_train:.1f}s")
 
@@ -529,7 +751,11 @@ peak_vram_mb = get_peak_memory_mb()
 
 print("---")
 print(f"val_mean_cos:        {val_mean_cos:.4f}")
-print(f"val_class_acc_pct:   {val_class_acc * 100:.2f}")
+print(f"val_recall_at_1_pct: {val_class_acc * 100:.4f}")
+print(f"val_cos_mask1:       {cos_by_masklen[1]:.4f}")
+print(f"val_cos_mask2:       {cos_by_masklen[2]:.4f}")
+print(f"val_cos_mask3:       {cos_by_masklen[3]:.4f}")
+print(f"val_subexpr_cos:     {val_subexpr_cos:.4f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_eval - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
