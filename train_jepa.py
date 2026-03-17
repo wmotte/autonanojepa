@@ -38,7 +38,8 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 N_EMBD = 168
 DEPTH = 4
 N_HEAD = 4            # 168 // 4 = 42 (even for RoPE)
-EMA_TAU = 0.999  # Slightly faster EMA target update
+EMA_TAU_START = 0.996   # I-JEPA cosine schedule: fast early (bootstrap random init)
+EMA_TAU_END   = 0.9999  # slow late (stable target for fine-grained alignment)
 VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 0.5
 VICREG_COV = 0.15       # Increased covariance regularization
@@ -706,8 +707,9 @@ while True:
     optimizer.update(model, grads)
     mx.eval(model.parameters(), *optimizer.state)
 
-    # EMA update of target encoder
-    ema_update(target_enc, model.ctx_encoder, EMA_TAU)
+    # EMA update of target encoder (I-JEPA cosine tau schedule)
+    tau = EMA_TAU_END - (EMA_TAU_END - EMA_TAU_START) * (math.cos(math.pi * progress) + 1) / 2
+    ema_update(target_enc, model.ctx_encoder, tau)
     mx.eval(target_enc.parameters())
 
     loss_f = float(loss.item())
