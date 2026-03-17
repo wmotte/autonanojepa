@@ -17,7 +17,19 @@ cc9ce98	68.1404	0.9	keep	N_EMBD=160, BS=28
 c0725a3	67.8804	0.9	keep	N_EMBD=160, N_HEAD=4, BS=28
 b5eac02	66.8401	1.0	keep	N_EMBD=168, BS=24 (over 1GB)
 cff51b0	67.4902	1.2	keep	N_EMBD=160, DEPTH=5 (over 1GB)
-1c9d6cd	68.5306	0.9	keep	N_EMBD=160, EMA_TAU=0.9995, BS=28 (BEST under 1GB)
+1c9d6cd	68.5306	0.9	keep	N_EMBD=160, EMA_TAU=0.9995, BS=28
 019f1d0	60.9883	0.9	discard	GAMMA=0.2, COV=0.05 (collapse)
 eaf8674	68.0104	0.9	keep	SUBEXPR_WEIGHT=0.5
 20fcfb7	67.4902	1.0	keep	N_EMBD=176, BS=24 (over 1GB)
+01f45a2	68.4005	1.0	keep	N_EMBD=168, BS=24 (over 1GB)
+ff81390	68.7906	0.9	keep	LR 0.001/0.01 (NEW BEST under 1GB)
+18f4263	68.4005	0.9	keep	LR 0.002/0.02
+b2db5b1	66.9701	0.9	keep	LR 0.0015/0.015
+c63dcc8	68.5306	0.9	keep	WARMUP_RATIO=0.1
+f1dadef	67.8804	0.9	keep	N_EMBD=164, N_HEAD=2
+b5e8c19	68.0104	1.2	keep	DEPTH=5, BS=24 (over 1GB)
+19b0668	67.7503	1.0	keep	N_EMBD=168, BS=24 (over 1GB)
+86c89fd	67.7503	1.1	keep	N_EMBD=176, BS=20 (over 1GB)
+2807997	69.9610	0.9	keep	remove iterative refinement (NEW BEST!)
+7ae4c88	67.7503	1.0	keep	N_EMBD=168, no refinement (over 1GB)
+92c4f85	68.4005	0.9	keep	LR 0.002/0.02, no refinement
