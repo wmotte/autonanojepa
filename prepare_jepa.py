@@ -2,7 +2,10 @@
 """
 Data preparation for nanoJEPA Clojure execution prediction.
 Generates (expression, result) pairs purely in Python — no Clojure runtime needed.
-FIXED: do not modify this file (autoresearch loop edits train_jepa.py only).
+
+Task: actual execution prediction — given a full Clojure expression, predict
+the embedding of its computed result. Both training and evaluation use real
+(expression, result) pairs; no masked-JEPA proxy.
 
 Usage: uv run prepare_jepa.py
 """
@@ -747,15 +750,33 @@ def _masked_pair(rng):
 
 
 def generate_pair(rng):
-    """Generate one masked (expr_tokens, span_tokens) pair via masked-JEPA.
+    """Generate one actual (expression, result) execution pair.
 
-    The expression has a contiguous span replaced by MASK tokens; the target
-    is the original tokens at those positions.  Span length: 60% single-token,
-    25% two-token, 15% three-token — single-token pairs are used for class
-    accuracy (nearest-neighbour over the 96-token vocabulary).
+    Returns (expr_tokens, result_tokens) where result_tokens is the computed
+    value of evaluating the expression. Families P (map-fn) and Q (filter-fn)
+    are excluded — their results are lazy collections represented as nil,
+    which creates degenerate duplicate embeddings in the retrieval pool.
     """
-    masked, span, _ = _masked_pair(rng)
-    return masked, span
+    r = rng.random()
+    if r < 0.13:   return _gen_arithmetic(rng)
+    elif r < 0.21: return _gen_let(rng)
+    elif r < 0.26: return _gen_hof(rng)
+    elif r < 0.30: return _gen_conditional(rng)
+    elif r < 0.36: return _gen_multi_let(rng)
+    elif r < 0.40: return _gen_hof_arithmetic(rng)
+    elif r < 0.43: return _gen_let_cond(rng)
+    elif r < 0.48: return _gen_deep_arithmetic(rng)
+    elif r < 0.54: return _gen_product(rng)
+    elif r < 0.59: return _gen_seq_let(rng)
+    elif r < 0.62: return _gen_hof_cross(rng)
+    elif r < 0.66: return _gen_reduce_fn(rng)
+    elif r < 0.71: return _gen_nested_let(rng)
+    elif r < 0.76: return _gen_triple_let(rng)
+    elif r < 0.80: return _gen_cond_form(rng)
+    elif r < 0.86: return _gen_threading(rng)
+    elif r < 0.90: return _gen_when(rng)
+    elif r < 0.94: return _gen_equality(rng)
+    else:          return _gen_not(rng)
 
 
 def encode_pair(vocab, expr_toks, res_toks, max_expr=MAX_EXPR_LEN, max_res=MAX_RESULT_LEN):
@@ -807,13 +828,15 @@ def _generate_val_cache():
     vocab = ClojureVocab()
     exprs, expr_masks, ress, res_masks, mask_lens = [], [], [], [], []
     for _ in range(N_VAL_PAIRS):
-        masked, span, span_len = _masked_pair(rng)
-        e, em, r, rm = encode_pair(vocab, masked, span)
+        expr_toks, result_toks = generate_pair(rng)
+        e, em, r, rm = encode_pair(vocab, expr_toks, result_toks)
         exprs.append(e)
         expr_masks.append(em)
         ress.append(r)
         res_masks.append(rm)
-        mask_lens.append(span_len)
+        # Expression complexity bucket: 1=short(≤7), 2=medium(≤14), 3=long(>14)
+        n = len(expr_toks)
+        mask_lens.append(1 if n <= 7 else 2 if n <= 14 else 3)
     data = np.concatenate([
         np.stack(exprs),
         np.stack(expr_masks),

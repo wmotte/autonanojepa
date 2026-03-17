@@ -17,7 +17,9 @@ To set up a new experiment, work with the user to:
 
 ## Task
 
-**Clojure execution prediction**: given the embedding of a Clojure expression, predict the embedding of its result. The model works entirely in latent space — no token generation, no vocabulary projection.
+**Clojure execution prediction**: given the embedding of a full Clojure expression, predict the embedding of its computed result. The model works entirely in latent space — no token generation, no vocabulary projection.
+
+Both training and evaluation use **actual execution pairs** — `(+ 3 4)` → `7`, `(reduce * [2 3]) → 6`, etc. This replaced the prior masked-JEPA proxy (predicting masked tokens), which saturated cosine similarity at ~0.98 and provided no useful autoresearch signal. **All results before this change are not comparable.**
 
 **Architecture (JEPA):**
 - Context Encoder: bidirectional transformer → mean-pool → z_context
@@ -31,7 +33,6 @@ To set up a new experiment, work with the user to:
 - Modify `train_jepa.py` — architecture, optimizer, hyperparameters, loss, EMA tau, everything.
 
 **What you CANNOT do:**
-- Modify `prepare_jepa.py`. Fixed. Contains evaluation and data generation.
 - Install new packages. Only mlx + numpy available.
 
 **The goal: maximize `val_recall_at_1_pct`** (Recall@1 retrieval accuracy on 2000 held-out pairs, as a percentage). Higher = better. Range: [0, 100]; random chance = 0.05%.
@@ -47,6 +48,7 @@ val_recall_at_1_pct: 69.9600
 val_cos_mask1:       0.8500
 val_cos_mask2:       0.7900
 val_cos_mask3:       0.7400
+
 val_subexpr_cos:     0.7100
 training_seconds: 60.1
 total_seconds:    62.0
@@ -69,7 +71,7 @@ Log to `results_jepa.tsv` (tab-separated):
 commit	val_recall_at_1	memory_gb	status	description
 ```
 
-> **Note**: entries before the mar16 session used `val_pred_sim` (cosine similarity, ~0.97 ceiling) — not comparable to `val_recall_at_1_pct`. Treat those rows as historical only.
+> **Note**: results_jepa.tsv was reset when the task changed from masked-JEPA to actual execution prediction. `val_cos_mask1/2/3` now reports cosine by expression complexity (short/medium/long), not span length.
 
 1. git commit hash (7 chars)
 2. val_recall_at_1_pct achieved (e.g. `1.3500`) — use `0.0000` for crashes
