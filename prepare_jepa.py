@@ -729,6 +729,6 @@ if __name__ == "__main__":
     encoded = vocab.encode(test_expr)
     print(f"\nEncode test '(+ 1 2)': {encoded}")
 
-    expr, em, res, rm = load_val_pairs()
+    expr, em, res, rm, mask_len = load_val_pairs()
     print(f"Val pairs loaded: expr shape={expr.shape}, res shape={res.shape}")
     print("Done.")
