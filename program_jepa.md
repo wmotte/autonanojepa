@@ -11,7 +11,7 @@ To set up a new experiment, work with the user to:
 2. **Read the in-scope files**:
    - `prepare_jepa.py` — fixed: vocab, data generator, val cache, dataloader. Do not modify.
    - `train_jepa.py` — the file you modify: model architecture, loss, optimizer, hyperparameters.
-3. **Verify val cache**: Check `~/.cache/autoresearch_jepa/val_pairs_v2.npz` exists. If not: `uv run prepare_jepa.py`.
+3. **Verify val cache**: Check `data/val_pairs.txt` exists. If not: `uv run prepare_jepa.py`.
 4. **Initialize results_jepa.tsv**: Run `uv run train_jepa.py` once to establish baseline.
 5. **Confirm and go**.
 
