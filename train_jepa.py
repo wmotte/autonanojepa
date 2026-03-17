@@ -21,6 +21,8 @@ from prepare_jepa import (
     MAX_EXPR_LEN,
     MAX_RESULT_LEN,
     TIME_BUDGET,
+    VOCAB_SIZE,
+    BOS_ID,
     ClojureVocab,
     load_val_pairs,
     make_jepa_dataloader,
@@ -35,54 +37,16 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 N_EMBD = 320
 DEPTH = 4
 N_HEAD = 5            # 320 // 5 = 64
-EMA_TAU = 0.9995
-VICREG_LAMBDA = 0.5
-VICREG_GAMMA = 0.2
-VICREG_COV = 0.05        # Covariance regularization weight (decorrelates z_ctx dims)
-HARD_NEG_WEIGHT = 0.1    # Weight for hard negative penalty
-QUEUE_WEIGHT = 0.1       # Weight for queue-based contrastive loss
-QUEUE_SIZE = 2048
-INTER_LOSS_WEIGHT = 0.3  # Weight for intermediate sub-expression loss
-DEVICE_BATCH_SIZE = 48
+EMA_TAU = 0.999
+VICREG_LAMBDA = 1.0
+VICREG_GAMMA = 0.5
+VICREG_COV = 0.1        # Covariance regularization weight (decorrelates z_ctx dims)
+DEVICE_BATCH_SIZE = 96
 MATRIX_LR = 0.0005
 EMBEDDING_LR = 0.005
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.05   # 5% warmup
 WARMDOWN_RATIO = 0.4  # Cosine decay over final 40%
-
-# ---------------------------------------------------------------------------
-# Global queue for MoCo-style contrastive loss
-# ---------------------------------------------------------------------------
-
-_NEG_QUEUE: np.ndarray | None = None  # numpy array — MLX arrays don't support in-place slice assignment
-_QUEUE_PTR = 0
-
-def update_queue(z_tgt):
-    """Store L2-normalised target embeddings in a numpy ring buffer."""
-    global _NEG_QUEUE, _QUEUE_PTR
-    mx.eval(z_tgt)
-    z_np = np.array(z_tgt, copy=False).astype(np.float32)
-    norms = np.linalg.norm(z_np, axis=-1, keepdims=True) + 1e-8
-    z_np = z_np / norms
-
-    B = z_np.shape[0]
-    if _NEG_QUEUE is None:
-        _NEG_QUEUE = np.zeros((QUEUE_SIZE, N_EMBD), dtype=np.float32)
-
-    end = _QUEUE_PTR + B
-    if end <= QUEUE_SIZE:
-        _NEG_QUEUE[_QUEUE_PTR:end] = z_np
-    else:
-        rem = QUEUE_SIZE - _QUEUE_PTR
-        _NEG_QUEUE[_QUEUE_PTR:] = z_np[:rem]
-        _NEG_QUEUE[:B - rem] = z_np[rem:]
-
-    _QUEUE_PTR = (_QUEUE_PTR + B) % QUEUE_SIZE
-
-def get_queue():
-    if _NEG_QUEUE is None:
-        return None
-    return mx.array(_NEG_QUEUE)
 
 # ---------------------------------------------------------------------------
 # Utilities (copied from train.py)
@@ -120,10 +84,10 @@ class BidirAttention(nn.Module):
         q = self.c_q(x).reshape(B, T, self.n_head, self.head_dim).transpose(0, 2, 1, 3)
         k = self.c_k(x).reshape(B, T, self.n_head, self.head_dim).transpose(0, 2, 1, 3)
         v = self.c_v(x).reshape(B, T, self.n_head, self.head_dim).transpose(0, 2, 1, 3)
-        
+
         q = norm(self.rope(q))
         k = norm(self.rope(k))
-        
+
         scale = 1.0 / math.sqrt(self.head_dim)
         # mask=None → full bidirectional attention
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=None)
@@ -178,24 +142,34 @@ class ClojureEncoder(nn.Module):
 
 
 class NanoJEPA(nn.Module):
-    """Context encoder + predictor MLP."""
+    """Context encoder + predictor MLP + reverse predictor (symmetric JEPA)."""
 
     def __init__(self, vocab_size, n_embd, n_layer, n_head):
         super().__init__()
         self.ctx_encoder = ClojureEncoder(vocab_size, n_embd, n_layer, n_head)
-        # Predictor: 3-layer MLP (256 → 1024 → 1024 → 256)
+        # Forward predictor: expr → result
         self.pred_fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
         self.pred_fc2 = nn.Linear(4 * n_embd, 4 * n_embd, bias=False)
         self.pred_fc3 = nn.Linear(4 * n_embd, n_embd, bias=False)
+        # Reverse predictor: result → expr (symmetric JEPA)
+        self.rev_pred_fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
+        self.rev_pred_fc2 = nn.Linear(4 * n_embd, 4 * n_embd, bias=False)
+        self.rev_pred_fc3 = nn.Linear(4 * n_embd, n_embd, bias=False)
 
     def predict(self, z):
-        h1 = norm(mx.maximum(self.pred_fc1(z), 0))
-        h2 = norm(mx.maximum(self.pred_fc2(h1), 0))
-        return self.pred_fc3(h2), h2
+        h = norm(mx.maximum(self.pred_fc1(z), 0))
+        h = norm(mx.maximum(self.pred_fc2(h), 0))
+        return self.pred_fc3(h)
+
+    def predict_reverse(self, z):
+        """Reverse predictor: predict expression embedding from result embedding."""
+        h = norm(mx.maximum(self.rev_pred_fc1(z), 0))
+        h = norm(mx.maximum(self.rev_pred_fc2(h), 0))
+        return self.rev_pred_fc3(h)
 
     def __call__(self, expr_tokens, expr_mask):
         z_ctx = self.ctx_encoder(expr_tokens, expr_mask)
-        z_pred, _ = self.predict(z_ctx)
+        z_pred = self.predict(z_ctx)
         return z_pred
 
 
@@ -239,38 +213,16 @@ def _set_nested(obj, path, value):
 
 def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask):
     z_ctx = model.ctx_encoder(expr_tokens, expr_mask)
-    z_pred, z_pred_mid = model.predict(z_ctx)
+    z_pred = model.predict(z_ctx)
     z_tgt = mx.stop_gradient(target_enc(res_tokens, res_mask))
 
     # L2-normalize for cosine loss
     z_pred_n = z_pred * mx.rsqrt(mx.sum(z_pred * z_pred, axis=-1, keepdims=True) + 1e-8)
     z_tgt_n = z_tgt * mx.rsqrt(mx.sum(z_tgt * z_tgt, axis=-1, keepdims=True) + 1e-8)
 
-    # Cosine loss (positive pair)
+    # Cosine loss
     cos_sim = mx.sum(z_pred_n * z_tgt_n, axis=-1)  # (B,)
     main_loss = 1.0 - mx.mean(cos_sim)
-
-    # Intermediate supervision: h2 (second predictor layer) should also align with target.
-    # h2 is returned by predict() — no recomputation needed.
-    z_pred_mid_n = z_pred_mid * mx.rsqrt(mx.sum(z_pred_mid * z_pred_mid, axis=-1, keepdims=True) + 1e-8)
-    inter_loss = 1.0 - mx.mean(mx.sum(z_pred_mid_n * z_tgt_n, axis=-1))
-
-    # In-batch hard negative mining
-    sim_matrix = mx.matmul(z_pred_n, mx.transpose(z_tgt_n))
-    B = sim_matrix.shape[0]
-    diag_mask = mx.eye(B) * -2.0
-    sim_matrix_masked = sim_matrix + diag_mask
-    hard_neg_sim = mx.max(sim_matrix_masked, axis=1)
-    neg_loss = mx.mean(mx.maximum(hard_neg_sim, 0.0))
-    
-    # Queue-based negative mining (MoCo)
-    queue = get_queue()
-    if queue is not None:
-        # sim_queue: (B, QUEUE_SIZE)
-        sim_queue = mx.matmul(z_pred_n, mx.transpose(queue))
-        queue_neg_loss = mx.mean(mx.maximum(mx.max(sim_queue, axis=1), 0.0))
-    else:
-        queue_neg_loss = 0.0
 
     # VICReg variance on z_pred (penalise collapsed predictor dimensions)
     z_pred_centered = z_pred - mx.mean(z_pred, axis=0, keepdims=True)
@@ -289,11 +241,16 @@ def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask
     off_diag_sq = mx.square(cov_ctx * (1.0 - diag_mask))
     cov_loss = mx.sum(off_diag_sq) / N_EMBD
 
+    # Symmetric JEPA: reverse loss (result → expression)
+    z_rev_pred = model.predict_reverse(z_tgt)
+    z_ctx_n = z_ctx * mx.rsqrt(mx.sum(z_ctx * z_ctx, axis=-1, keepdims=True) + 1e-8)
+    z_rev_pred_n = z_rev_pred * mx.rsqrt(mx.sum(z_rev_pred * z_rev_pred, axis=-1, keepdims=True) + 1e-8)
+    rev_cos_sim = mx.sum(z_rev_pred_n * z_ctx_n, axis=-1)
+    rev_loss = 1.0 - mx.mean(rev_cos_sim)
+
     return (
         main_loss
-        + INTER_LOSS_WEIGHT * inter_loss
-        + HARD_NEG_WEIGHT * neg_loss
-        + QUEUE_WEIGHT * queue_neg_loss
+        + 0.5 * rev_loss  # Symmetric JEPA weight
         + VICREG_LAMBDA * (var_pred_loss + var_ctx_loss)
         + VICREG_COV * cov_loss
     )
@@ -388,15 +345,17 @@ class AdamW:
 
 
 def evaluate_val_retrieval(model, target_enc, batch_size=256):
-    """Recall@1 on 2000 val pairs: does predict(encode(expr)) retrieve the correct result?
+    """Evaluate on 2000 masked-JEPA val pairs.
 
-    1.0 = perfect retrieval, ~0.0005 = random (1/2000). Unlike cosine similarity,
-    this metric cannot be gamed by representation collapse — collapsed embeddings
-    give near-zero recall because all predictions tie and argmax picks arbitrarily.
+    Returns (val_mean_cos, val_class_acc):
+      - val_mean_cos:   mean cosine similarity between predicted and target embeddings.
+      - val_class_acc:  token-level accuracy on single-token mask pairs (nearest neighbour
+                        over all 96 vocab tokens). Random baseline = 1/96 ≈ 1%.
     """
-    expr, expr_mask, res, res_mask = load_val_pairs()
+    expr, expr_mask, res, res_mask, mask_len = load_val_pairs()
     N = len(expr)
-    all_z_pred, all_z_tgt = [], []
+    cos_sims = []
+    all_z_pred = []
 
     for start in range(0, N, batch_size):
         end = min(start + batch_size, N)
@@ -407,24 +366,40 @@ def evaluate_val_retrieval(model, target_enc, batch_size=256):
 
         z_pred = model(e, em)
         z_tgt = mx.stop_gradient(target_enc(r, rm))
-        mx.eval(z_pred, z_tgt)
-        all_z_pred.append(z_pred)
-        all_z_tgt.append(z_tgt)
 
-    z_pred_all = mx.concatenate(all_z_pred, axis=0)   # (N, D)
-    z_tgt_all = mx.concatenate(all_z_tgt, axis=0)     # (N, D)
+        z_pred_n = z_pred * mx.rsqrt(mx.sum(z_pred * z_pred, axis=-1, keepdims=True) + 1e-8)
+        z_tgt_n = z_tgt * mx.rsqrt(mx.sum(z_tgt * z_tgt, axis=-1, keepdims=True) + 1e-8)
 
-    # L2-normalize
-    z_pred_n = z_pred_all * mx.rsqrt(mx.sum(z_pred_all * z_pred_all, axis=-1, keepdims=True) + 1e-8)
-    z_tgt_n = z_tgt_all * mx.rsqrt(mx.sum(z_tgt_all * z_tgt_all, axis=-1, keepdims=True) + 1e-8)
+        cos_sim = mx.sum(z_pred_n * z_tgt_n, axis=-1)  # (batch,)
+        mx.eval(cos_sim, z_pred_n)
+        cos_sims.append(cos_sim)
+        all_z_pred.append(z_pred_n)
 
-    # (N, N) similarity matrix → Recall@1
-    sim_matrix = mx.matmul(z_pred_n, mx.transpose(z_tgt_n))
-    labels = mx.arange(N, dtype=mx.int32)
-    predicted = mx.argmax(sim_matrix, axis=1).astype(mx.int32)
-    recall_at_1 = mx.mean((predicted == labels).astype(mx.float32))
-    mx.eval(recall_at_1)
-    return float(recall_at_1.item())
+    mean_cos = float(mx.mean(mx.concatenate(cos_sims, axis=0)).item())
+
+    # --- Class accuracy on single-token mask pairs ---
+    # Build one prototype embedding per vocab token: target_enc([BOS, tok, PAD...], [1,1,0...])
+    proto_tok = np.zeros((VOCAB_SIZE, MAX_RESULT_LEN), dtype=np.int32)
+    proto_msk = np.zeros((VOCAB_SIZE, MAX_RESULT_LEN), dtype=np.float32)
+    proto_tok[:, 0] = BOS_ID
+    proto_tok[np.arange(VOCAB_SIZE), 1] = np.arange(VOCAB_SIZE)
+    proto_msk[:, 0] = 1.0
+    proto_msk[:, 1] = 1.0
+    z_proto = mx.stop_gradient(target_enc(mx.array(proto_tok), mx.array(proto_msk)))
+    z_proto_n = z_proto * mx.rsqrt(mx.sum(z_proto * z_proto, axis=-1, keepdims=True) + 1e-8)
+    mx.eval(z_proto_n)
+
+    single_idx = np.where(mask_len == 1)[0]
+    class_acc = 0.0
+    if len(single_idx) > 0:
+        z_pred_all = mx.concatenate(all_z_pred, axis=0)          # (N, D)
+        z_single = z_pred_all[mx.array(single_idx, dtype=mx.int32)]  # (M, D)
+        sims = mx.matmul(z_single, mx.transpose(z_proto_n))          # (M, 96)
+        pred_toks = mx.argmax(sims, axis=1)                          # (M,)
+        true_toks = mx.array(res[single_idx, 1], dtype=mx.int32)     # token after BOS
+        class_acc = float(mx.mean((pred_toks == true_toks).astype(mx.float32)).item())
+
+    return mean_cos, class_acc
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +410,6 @@ t_start = time.time()
 mx.random.seed(42)
 
 vocab = ClojureVocab()
-from prepare_jepa import VOCAB_SIZE
 
 train_loader = make_jepa_dataloader(vocab, DEVICE_BATCH_SIZE)
 
@@ -504,14 +478,8 @@ while True:
     optimizer.update(model, grads)
     mx.eval(model.parameters(), *optimizer.state)
 
-    # EMA update of target encoder (skip step 0 — used only for compilation)
-    if step > 0:
-        ema_update(target_enc, model.ctx_encoder, EMA_TAU)
-
-    # Update MoCo queue with post-EMA target embeddings
-    z_tgt_for_queue = target_enc(res_t, res_m)
-    update_queue(z_tgt_for_queue)  # mx.eval happens inside update_queue
-
+    # EMA update of target encoder
+    ema_update(target_enc, model.ctx_encoder, EMA_TAU)
     mx.eval(target_enc.parameters())
 
     loss_f = float(loss.item())
@@ -553,14 +521,15 @@ t_train = time.time()
 print(f"Training completed in {t_train - (t_compiled or t_start):.1f}s")
 
 print("Starting final eval...")
-val_recall_at_1 = evaluate_val_retrieval(model, target_enc)
+val_mean_cos, val_class_acc = evaluate_val_retrieval(model, target_enc)
 t_eval = time.time()
 print(f"Final eval completed in {t_eval - t_train:.1f}s")
 
 peak_vram_mb = get_peak_memory_mb()
 
 print("---")
-print(f"val_recall_at_1_pct: {val_recall_at_1 * 100:.4f}")
+print(f"val_mean_cos:        {val_mean_cos:.4f}")
+print(f"val_class_acc_pct:   {val_class_acc * 100:.2f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_eval - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")

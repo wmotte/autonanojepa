@@ -1,57 +1,8 @@
-e Design inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch)
+# nanoJEPA — Clojure Masked-JEPA on Apple Silicon
 
-# nanoJEPA — Clojure Execution Prediction on Apple Silicon
-
-An MLX implementation of a Joint Embedding Predictive Architecture (JEPA) whose task is to **evaluate Clojure expressions in latent space**: given the embedding of a Clojure expression, predict the embedding of its result — without ever generating tokens.
+An MLX implementation of a Joint Embedding Predictive Architecture (JEPA) whose task is **masked code understanding**: given a Clojure expression with a span of tokens replaced by a single opaque `MASK`, predict the embedding of the masked span — without ever generating tokens.
 
 This runs natively on Apple Silicon via MLX (unified memory, no PyTorch, no CUDA). The autoresearch loop (`program_jepa.md`) iteratively improves the model within a fixed time budget.
-
----
-
-## Background & Motivation
-
-### The problem with autoregressive evaluation
-
-Standard language models learn to evaluate code the same way they learn everything else: by predicting the next token. When asked `(+ 3 5)`, a GPT-style model generates `8` by sampling from a probability distribution over its entire vocabulary, one token at a time. This works, but it is fundamentally the wrong level of abstraction for program semantics. The model does not need to know what `8` *looks like* — it needs to know what it *means*.
-
-Token generation conflates two very different problems:
-1. **Semantic understanding** — knowing that `(+ 3 5)` evaluates to the integer eight
-2. **Surface rendering** — knowing that the integer eight is spelled `8` in a given context
-
-For most downstream uses of code understanding (retrieval, program synthesis, bug detection, reachability analysis), only (1) matters. Forcing the model to solve (2) as a prerequisite adds unnecessary complexity, a large output head, and a training objective that rewards surface-level pattern matching over genuine semantic reasoning.
-
-### What JEPA does differently
-
-Joint Embedding Predictive Architectures (JEPAs), introduced by LeCun and collaborators in the context of vision (I-JEPA, V-JEPA), flip this around: instead of predicting *tokens*, the model predicts *representations*. Given an input, the context encoder produces a latent embedding; a lightweight predictor then maps that embedding to the expected embedding of some related view — without ever decoding back to tokens.
-
-Applied to code execution, the two views are:
-- **Expression view**: the Clojure source `(+ 3 5)`
-- **Result view**: the value `8`
-
-The model's job is to learn a representation space in which `(+ 3 5)` and `8` are geometrically close — not by memorising that the string `"8"` follows the string `"(+ 3 5)"`, but by learning the *transformation* that execution applies in embedding space.
-
-This is closer to how humans reason about code: we mentally evaluate expressions without reciting their character-by-character output.
-
-### Why Clojure?
-
-Clojure is a near-ideal testbed for latent execution prediction:
-
-- **Pure, referentially transparent semantics.** The same expression always evaluates to the same result. There are no side effects, no mutable state, and no environment dependencies to track. The expression → result mapping is a true mathematical function, which is exactly what we want the embedding space to encode.
-- **Homoiconic, minimal syntax.** Clojure code is data (S-expressions). The entire syntax relevant to this project fits in 96 tokens — small enough to study in full without subword tokenisation or BPE merges.
-- **Synthetic data generation without a runtime.** Because the expression family is finite and well-specified, Python can generate valid (expression, result) pairs directly — no Clojure JVM required. Training data is infinite, non-repeating, and perfectly balanced across difficulty levels.
-- **Semantic gap between expression and result.** For families like sequential `let` bindings or multiplication chains, the result is almost never visible as a literal token in the expression. The model cannot shortcut by copying tokens — it must learn the computation.
-
-### Why Apple Silicon / MLX?
-
-The goal is accessible, reproducible research with fast iteration. MLX runs natively on the Apple Neural Engine and GPU via unified memory — no discrete GPU, no CUDA, no data-copy overhead between CPU and device memory. A MacBook Pro M-series chip can run ~6,000 training steps in two minutes. This makes the autoresearch loop (tens of experiments per hour) practical without cloud compute.
-
-### The autoresearch angle
-
-This project is not just a model — it is a research environment. The `program_jepa.md` protocol turns an AI coding agent into an autonomous experimenter: propose a hypothesis, edit `train_jepa.py`, commit, run, measure, log, keep or discard. The agent operates within a fixed 2-minute time budget per run, so dozens of experiments can be evaluated in a single session.
-
-The larger aim is **Neural Execution Models** (NEMs): neural networks that do not simulate a program by generating its output tokens, but instead model program execution as a continuous transformation in embedding space. A NEM takes a program representation and produces a representation of its result — potentially composing multiple execution steps without ever surfacing discrete symbols.
-
-nanoJEPA is a minimal proof-of-concept in this direction. If a small JEPA model can learn a reliable latent map from Clojure expressions to their results on a restricted vocabulary, it demonstrates that execution semantics are geometrically learnable — that there exists a useful structure in embedding space that mirrors what an interpreter does. Scaling this idea raises harder questions: can the same principle extend to multi-step programs, richer type systems, or real-world code? Can latent execution be composed — i.e., can the predicted result embedding of one expression serve as the input to predicting another? These are the questions nanoJEPA is designed to probe at small scale before committing to larger experiments.
 
 ---
 
@@ -65,7 +16,7 @@ Traditional language model evaluation requires:
 JEPA sidesteps all of this. The model works **entirely in latent space**:
 
 ```
-Clojure expression  →  Context Encoder  →  z_context
+(+ MASK 5)          →  Context Encoder  →  z_context
                                                 ↓
                                            Predictor  →  z_pred
                                                               ↓
@@ -73,10 +24,10 @@ Clojure expression  →  Context Encoder  →  z_context
                                                     + VICReg variance (z_pred + z_ctx)
                                                     + covariance reg (z_ctx)
 
-Clojure result  →  Target Encoder (EMA)  →  z_target
+[3]  →  Target Encoder (EMA)  →  z_target      (the masked span)
 ```
 
-This is a natural fit for functional/immutable Clojure semantics: a Clojure expression and its result have a **deterministic semantic relationship** that is easier to encode as a vector transformation than as a sequence of output tokens.
+The masked span is replaced by a **single opaque `MASK` token** regardless of span length (1–5 tokens), so the model cannot infer how many tokens are missing — it must predict both the content and the extent of the gap. This is harder than BERT-style masking (which uses one `[MASK]` per token and reveals span length) and avoids token-level classification in favour of latent-space prediction.
 
 ---
 
@@ -92,34 +43,7 @@ A 4-layer **bidirectional** Transformer (no causal mask). Input tokens attend to
 - Final LayerNorm on pooled output
 
 ### Target Encoder
-Identical architecture to the context encoder, but **updated only via Exponential Moving Average** of the context encoder's weights (`EMA_TAU`). It never receives gradients — it's the "teacher" that provides stable training targets.
-
-Each training step updates the target encoder as:
-
-```
-θ_target ← τ · θ_target + (1 − τ) · θ_context
-```
-
-The target encoder's memory of its state `n` steps ago decays as τⁿ. The **half-life** — the number of steps until that memory is halved — is:
-
-```
-n½ = log(0.5) / log(τ)
-```
-
-| τ | half-life | character |
-|---|---|---|
-| 0.99 | ~69 steps | fast-moving, unstable target |
-| 0.996 | ~173 steps | BYOL/I-JEPA default |
-| 0.9995 | ~1,386 steps | slow-moving, very stable target |
-
-The value τ=0.996 originates from the **BYOL paper** (Grill et al., 2020), which popularised the EMA teacher-student setup that JEPA inherits. I-JEPA (Assran et al., 2023) uses the same value. It was not derived from first principles — it was tuned empirically on ImageNet-scale training and then adopted as a community default.
-
-The current code uses `EMA_TAU = 0.9995` because the encoders are **independently initialised** (rather than copied from each other at the start). Bridging the gap between two randomly initialised networks requires more time, so a slower-moving target gives the predictor room to learn before the target shifts again. With τ=0.9995 and ~6,000 steps, the target encoder goes through only ~4 half-lives over the full training run — it tracks the context encoder gradually rather than chasing it.
-
-The practical trade-off:
-- **τ too low**: target updates too fast → unstable training signal → loss oscillates
-- **τ too high**: target barely moves → predictor has too easy a job → slow learning
-- **τ=0.9995** (current): chosen to suit the short 120 s budget with independent init
+Identical architecture to the context encoder, but **updated only via Exponential Moving Average** of the context encoder's weights (τ=0.996). It never receives gradients — it's the "teacher" that provides stable training targets.
 
 ### Predictor
 A **3-layer MLP**: `256 → 1024 → 1024 → 256` (ReLU activations). Maps the context embedding to the predicted target embedding.
@@ -172,7 +96,7 @@ The target encoder has no direct gradient path — it is updated purely via EMA 
 | 38–44 | `x y z a b n m` | 7 |
 | 45–85 | integers −10 to 30 as discrete tokens | 41 |
 | 86–89 | `true false nil pos?` | 4 |
-| 90–95 | reserved | 6 |
+| 90–95 | `MASK -> ->> when not =` | 6 |
 
 No external tokenizer. No subword merges. Tokens map 1:1 to Clojure syntax elements.
 
@@ -182,7 +106,7 @@ No external tokenizer. No subword merges. Tokens map 1:1 to Clojure syntax eleme
 
 All expressions are generated **purely in Python** — no Clojure runtime required. The generator maintains the distribution at runtime, so training data is infinite and non-repeating.
 
-The distribution is intentionally shifted toward families where the result does **not** appear as a literal token in the expression (marked **hard** below), making surface-statistics shortcuts insufficient.
+A random contiguous span (1–5 tokens) is masked before encoding. The single opaque `MASK` token replaces the whole span, so the model must infer both content and length.
 
 ### A — Arithmetic (20%)
 ```clojure
@@ -259,7 +183,7 @@ Products are typically absent from the expression's literal tokens. `(* x x)` = 
 (let [a 3 b (* a 4)] (+ b 2))   → 14
 (let [x 2 y (+ x 3)] (* y 2))  → 10
 ```
-Second binding uses the first — this is `let*` semantics (sequential scoping), not standard Clojure `let` (which is parallel). The Python evaluator implements it correctly as sequential; the expressions are valid `let*` forms. Result requires two levels of computation; the answer virtually never appears as a token in the expression.
+Second binding uses the first (true Clojure `let` semantics). Result requires two levels of computation; the answer virtually never appears as a token in the expression.
 
 ### K — HOF cross-product (4%) **hard**
 ```clojure
@@ -267,6 +191,34 @@ Second binding uses the first — this is `let*` semantics (sequential scoping),
 (mod (reduce + [3 5 7]) 4)       → 3
 ```
 Aggregate a sequence, then apply a second operation. The `mod` variant produces a small residue that is maximally distant from all input tokens.
+
+### L — Threading macro (5%)
+```clojure
+(-> 3 (inc) (+ 2))               → 6
+(-> 5 (dec) (dec))               → 3
+```
+Uses the `->` threading macro. The value threads through each step; tests whether the model understands positional data flow.
+
+### M — When form (4%)
+```clojure
+(when (pos? 4) 7)                → 7
+(when (pos? -2) 5)               → nil
+```
+`when` returns the body when the condition is truthy, `nil` otherwise. Introduces `nil` as a meaningful result.
+
+### N — Equality (2.5%)
+```clojure
+(= 3 3)                          → true
+(= 4 7)                          → false
+```
+Simple equality check; result is boolean. Tests the model's ability to predict `true`/`false` from numeric comparison.
+
+### O — Logical not (1.5%)
+```clojure
+(not (pos? -3))                  → true
+(not (pos? 5))                   → false
+```
+Logical negation of a `pos?` predicate.
 
 ---
 
@@ -290,7 +242,7 @@ uv run prepare_jepa.py
 uv run train_jepa.py
 ```
 
-No data downloads. No internet access required after setup. The validation set is deterministic (seed=12345) and cached at `~/.cache/autoresearch_jepa/val_pairs_v2.npz`.
+No data downloads. No internet access required after setup. The validation set is deterministic (seed=12345) and cached at `~/.cache/autoresearch_jepa/val_pairs_v4.npz`.
 
 ---
 
@@ -306,22 +258,24 @@ No data downloads. No internet access required after setup. The validation set i
 
 ---
 
-## Evaluation metric
+## Evaluation metrics
 
-`val_recall_at_1_pct` — retrieval accuracy on 2000 held-out (expression, result) pairs, expressed as a percentage:
+Two complementary metrics are reported after training:
 
-```
-For each expr_i in val set:
-  rank all 2000 target embeddings by cosine_sim(predict(encode(expr_i)), target_enc(result_j))
-  Recall@1 = fraction where argmax_j == i  (multiplied by 100 for output)
-```
+### `val_mean_cos`
+Mean cosine similarity between `predict(encode(masked_expr))` and `target_enc(masked_span)` over 2000 held-out pairs.
 
-Range: [0, 100]. Higher is better. A value of 100 means every expression retrieves its exact result as the nearest neighbour among 2000 candidates. Random chance = 1/2000 = **0.05%**.
+Range: [−1, 1]. Higher is better. ~0 = random; 1.0 = perfect alignment. Unaffected by duplicate target values (unlike retrieval metrics) because it scores each pair independently.
 
-**Why not cosine similarity?** The old `val_pred_sim` metric (average cosine similarity against the paired target) is gameable by representation collapse: if all embeddings collapse to the same vector, cosine similarity is trivially ~1.0 even though the model has learned nothing. Retrieval accuracy cannot be gamed this way — collapsed embeddings yield near-zero recall because all 2000 predictions tie and `argmax` picks the first index for all queries.
+### `val_class_acc_pct`
+Token-level accuracy on the ~40% of val pairs where `mask_len == 1` (single masked token). For each such pair, the predicted embedding is compared against the prototype embeddings of all 96 vocabulary tokens (computed by passing `[BOS, token]` through the target encoder); the nearest neighbour must match the true masked token.
+
+Range: [0, 100]. Random baseline = 1/96 ≈ **1%**.
+
+This metric is collapse-resistant: a model that outputs a constant vector maps to the same token for all inputs, giving near-random accuracy even if `val_mean_cos` looks inflated.
 
 ```bash
-grep "^val_recall_at_1_pct:" run.log
+grep "^val_mean_cos:\|^val_class_acc_pct:" run.log
 ```
 
 ---
@@ -345,7 +299,7 @@ The rise-then-plateau pattern is expected JEPA behaviour: the EMA target encoder
 `TIME_BUDGET = 120 s` (2 minutes). Reasoning:
 - ~20 ms/step → 120 s ≈ 6,000 steps
 - Shorter budget raises experiment throughput for the autoresearch loop (~7/hour → ~20/hour)
-- 120 s gives the EMA encoder time to properly stabilise (τ=0.9995 → half-life ≈ 1,386 steps → ~4 half-lives over the full run)
+- 120 s gives the EMA encoder time to properly stabilise (τ=0.996 → half-life ≈ 170 steps)
 - LR schedule: 5% linear warmup + flat + 40% cosine decay
 
 ---
@@ -372,11 +326,11 @@ Things worth trying:
 
 | | `train.py` (GPT) | `train_jepa.py` (nanoJEPA) |
 |---|---|---|
-| Task | Next-token prediction | Execution prediction in latent space |
+| Task | Next-token prediction | Masked span prediction in latent space |
 | Attention | Causal (sliding window) | Bidirectional (no mask) |
 | Output head | `lm_head` (vocab projection) | None — no token generation |
 | Loss | Cross-entropy | Cosine + VICReg (pred + ctx) + covariance |
-| Metric | `val_bpb` (lower = better) | `val_recall_at_1_pct` (higher = better, %) |
+| Metric | `val_bpb` (lower = better) | `val_mean_cos` + `val_class_acc_pct` (higher = better) |
 | Target | Fixed (ground truth tokens) | Moving (EMA encoder) |
 | Data | Web text (parquet shards) | Synthetic Clojure pairs (infinite) |
 | Memory | ~860 MB | ~860 MB |

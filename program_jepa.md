@@ -81,42 +81,14 @@ LOOP FOREVER:
 
 1. Check git state (branch/commit).
 2. Modify `train_jepa.py` with an experimental idea.
-3. `git add train_jepa.py && git commit -m "experiment: <description>"`
+3. `git add autoresearch-mlx/train_jepa.py && git commit -m "experiment: <description>"`
 4. Run: `uv run train_jepa.py > run.log 2>&1`
 5. Check: `grep "^val_recall_at_1_pct:\|^peak_vram_mb:" run.log`
 6. If empty → crashed. Run `tail -n 50 run.log` for stack trace.
 7. Record in `results_jepa.tsv`.
-8. If `val_recall_at_1_pct` **improved** (higher): `git add results_jepa.tsv && git commit -m "results: <description>"`
+8. If `val_recall_at_1_pct` **improved** (higher): `git add autoresearch-mlx/results_jepa.tsv && git commit --amend --no-edit`
 9. If equal or worse: record hash, then `git reset --hard <previous kept commit>`
 
 **Timeout**: ~3 min per experiment. Kill and discard if >8 min.
 
 **NEVER STOP**: Run autonomously until manually interrupted. If out of ideas, think harder.
-
-## Architectural ambition
-
-Hyperparameter tuning alone is unlikely to produce a meaningful contribution. At the current trajectory (1.40% → 1.85% over a handful of hyperparameter experiments), the model is making incremental gains but has not yet demonstrated genuine execution reasoning. To matter as a contribution to neural execution modelling, the architecture itself must change.
-
-**Directions worth trying, in rough order of invasiveness:**
-
-1. **Deeper / wider predictor**: The 3-layer MLP may be too shallow to simulate multi-step reduction. Try 4–6 layers, residual connections, or a small transformer predictor that operates over the context embedding as a sequence of "reduction steps."
-
-2. **Explicit intermediate state representations**: Add auxiliary loss terms that encourage the predictor's hidden layers to represent identifiable intermediate values (e.g., the result of the inner sub-expression before the outer one is applied). This can be implemented by generating expression–subresult pairs from the data generator's existing structure and supervising intermediate activations. *(Already partially implemented: `INTER_LOSS_WEIGHT * inter_loss` supervises h2 against the target. Next step: supervise h1 as well, or generate genuine subexpression–subresult pairs from the data generator rather than reusing the same target embedding.)*
-
-3. **Curriculum from easy to hard families**: Train first on families A–B (arithmetic, single let), then introduce C–H (HOF, conditionals, multi-binding), and only later expose the model to I–J–K (multiplication, sequential let, cross-product). A staged curriculum lets the model build compositional representations before facing cases where the result is not a literal token in the input.
-
-4. **Separate encoder per syntactic role**: Rather than mean-pooling all tokens together, pool sub-expressions separately (operator, arguments, bindings) and combine via a small attention layer. This injects structural bias without requiring changes to `prepare_jepa.py`.
-
-5. **Contrastive hard-negative mining**: In the retrieval loss, instead of random negatives from the batch, mine hard negatives — results that are close in embedding space but correspond to different expressions. This sharpens the representation boundary between similar-but-distinct execution outcomes.
-
-6. **Recursive / hierarchical encoding**: Clojure expressions are S-expression trees. Instead of treating the token sequence as flat, build a bottom-up composition pass: encode each leaf token, then compose sibling sub-expressions via a small MLP or single-layer attention, then compose at the next level up. This mirrors the actual evaluation order and gives the encoder an inductive bias toward tree structure — which the current flat mean-pooling discards entirely.
-
-7. **Multi-step predictor unrolling**: Replace the single MLP forward pass with K unrolled steps, each refining the predicted embedding. Concretely, the predictor receives `(z_ctx, h_{k-1})` and outputs `h_k`; the final `h_K` is compared to `z_target`. This recurrent structure directly mimics iterative reduction and gives the model a mechanism to perform multi-hop reasoning within the predictor rather than expecting a single MLP to do it all at once.
-
-8. **Momentum contrast queue (MoCo-style)**: The current batch of 96 provides only 95 negatives per anchor. Maintain a first-in-first-out queue of recent `z_target` embeddings (e.g., 2048–4096 entries) as a memory bank. The predictor must retrieve the correct result from this much larger pool, producing a far stronger gradient signal and forcing sharper embeddings without requiring a larger batch. *(Already implemented with `QUEUE_SIZE=2048` and `QUEUE_WEIGHT=0.1`. Was previously broken due to MLX in-place slice assignment semantics — now fixed (numpy ring buffer). Worth tuning `QUEUE_SIZE` and `QUEUE_WEIGHT`.)*
-
-9. **Auxiliary result-type classification head**: Add a small classification head on top of `z_pred` that predicts a coarse category of the result (e.g., negative integer, zero-to-ten, large positive, boolean, list). Train this with cross-entropy alongside the primary cosine loss. The auxiliary signal provides a direct semantic anchor — the model cannot satisfy the type head via representation collapse — and costs almost nothing computationally.
-
-10. **Symmetric / bidirectional JEPA**: Also train a reverse predictor that maps `z_target → z_context`. This symmetric objective forces both encoders to embed expressions and results in a mutually aligned space rather than two independent manifolds that happen to be pulled together only from one direction. The reverse predictor shares no weights with the forward one; it adds roughly 0.8M parameters and doubles the gradient signal per batch.
-
-The bar for a meaningful result is approximately **30–50% recall@1 on the full validation set**, sustained across the hard families (I, J, K). Until then, architectural changes — not hyperparameter search — are the primary lever.

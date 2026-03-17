@@ -24,7 +24,7 @@ TIME_BUDGET = 120
 N_VAL_PAIRS = 2000
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch_jepa")
-VAL_CACHE_PATH = os.path.join(CACHE_DIR, "val_pairs_v3.npz")
+VAL_CACHE_PATH = os.path.join(CACHE_DIR, "val_pairs_v4.npz")
 
 # ---------------------------------------------------------------------------
 # Vocabulary
@@ -41,10 +41,10 @@ _VARS = ["x", "y", "z", "a", "b", "n", "m"]  # 38-44
 _NUMBERS = [str(i) for i in range(-10, 31)]  # 41 tokens
 # Booleans and nil (86-89)
 _BOOLEANS = ["true", "false", "nil", "pos?"]  # 86-89 (pos? needed for conditionals)
-# Padding to reach exactly 96
-_PADDING_TOKENS = [f"<reserved_{i}>" for i in range(96 - 4 - 6 - 10 - 8 - 5 - 5 - 7 - 41 - 4)]
+# Extra Clojure tokens (90-95) — replaces reserved padding
+_EXTRA = ["MASK", "->", "->>", "when", "not", "="]  # 90-95
 
-_ALL_TOKENS = _SPECIAL + _SYNTAX + _OPERATORS + _HOF + _DICT + _FORMS + _VARS + _NUMBERS + _BOOLEANS + _PADDING_TOKENS
+_ALL_TOKENS = _SPECIAL + _SYNTAX + _OPERATORS + _HOF + _DICT + _FORMS + _VARS + _NUMBERS + _BOOLEANS + _EXTRA
 
 assert len(_ALL_TOKENS) == VOCAB_SIZE, f"Expected {VOCAB_SIZE} tokens, got {len(_ALL_TOKENS)}"
 
@@ -55,6 +55,8 @@ PAD_ID = _TOKEN_TO_ID["PAD"]
 BOS_ID = _TOKEN_TO_ID["BOS"]
 SEP_ID = _TOKEN_TO_ID["SEP"]
 EOS_ID = _TOKEN_TO_ID["EOS"]
+MASK_ID = _TOKEN_TO_ID["MASK"]
+MASK_STR = "MASK"
 
 
 class ClojureVocab:
@@ -74,7 +76,7 @@ class ClojureVocab:
         if isinstance(token_list, str):
             # Try splitting as space-separated
             token_list = token_list.split()
-        return [self.token_to_id[t] for t in token_list]
+        return [self.token_to_id[t] for t in token_list if t in self.token_to_id]
 
     def decode(self, ids):
         return [self.id_to_token.get(i, "?") for i in ids if i not in (PAD_ID,)]
@@ -225,7 +227,7 @@ def _gen_hof(rng):
         result = max(-10, min(30, int(round(result))))
         return toks, [_num_tok(result)]
 
-    else:
+    elif choice < 0.8:
         # (first [a b c]) or (last [a b c])
         n = rng.randint(2, 5)
         elems = [rng.randint(-5, 15) for _ in range(n)]
@@ -233,6 +235,13 @@ def _gen_hof(rng):
         result = elems[0] if fn == "first" else elems[-1]
         toks = ["(", fn, "["] + [_num_tok(e) for e in elems] + ["]", ")"]
         return toks, [_num_tok(result)]
+
+    else:
+        # (count [a b c]) variant — simple
+        n = rng.randint(1, 4)
+        elems = [rng.randint(0, 10) for _ in range(n)]
+        toks = ["(", "count", "["] + [_num_tok(e) for e in elems] + ["]", ")"]
+        return toks, [_num_tok(n)]
 
 
 def _gen_conditional(rng):
@@ -434,11 +443,8 @@ def _gen_product(rng):
 
 
 def _gen_seq_let(rng):
-    """Family J: sequential let* where second binding uses first.
+    """Family J: sequential let where second binding uses first.
     (let [a 3 b (* a 4)] (+ b 2)) → 14 — result absent from tokens.
-    Note: standard Clojure `let` has parallel bindings; this implements `let*`
-    semantics (second binding sees first). The Python evaluator is correct;
-    the expressions are valid let* forms, not let forms.
     """
     var1 = rng.choice(["a", "n", "x", "y"])
     var2 = rng.choice([v for v in ["a", "b", "n", "x", "y", "z"] if v != var1])
@@ -504,69 +510,132 @@ def _gen_hof_cross(rng):
         return toks, [_num_tok(result)]
 
 
-def generate_pair(rng):
-    """Generate one (expr_tokens, result_tokens) pair.
+def _gen_threading(rng):
+    """Family L: threading macro. (-> start (op arg) ...) → result"""
+    start = rng.randint(-5, 10)
+    n_steps = rng.randint(1, 3)
+    toks = ["(", "->", _num_tok(start)]
+    result = start
+    for _ in range(n_steps):
+        op = rng.choice(["inc", "dec", "+", "-"])
+        if op == "inc":
+            result += 1
+            toks += ["(", "inc", ")"]
+        elif op == "dec":
+            result -= 1
+            toks += ["(", "dec", ")"]
+        else:
+            k = rng.randint(1, 5)
+            result = result + k if op == "+" else result - k
+            toks += ["(", op, _num_tok(k), ")"]
+    toks.append(")")
+    result = max(-10, min(30, result))
+    return toks, [_num_tok(result)]
 
-    Distribution (shifted toward harder families where result ∉ expr tokens):
-      A arithmetic        20%
-      B let               12%
-      C HOF                8%
-      D conditional        7%
-      E multi-binding let  9%
-      F HOF + arithmetic   7%
-      G let + conditional  5%
-      H depth-3 arith      8%
-      I product (hard)    12%
-      J seq-let (hard)     8%
-      K HOF-cross (hard)   4%
-    """
-    r = rng.random()
-    if r < 0.20:
-        return _gen_arithmetic(rng)
-    elif r < 0.32:
-        return _gen_let(rng)
-    elif r < 0.40:
-        return _gen_hof(rng)
-    elif r < 0.47:
-        return _gen_conditional(rng)
-    elif r < 0.56:
-        return _gen_multi_let(rng)
-    elif r < 0.63:
-        return _gen_hof_arithmetic(rng)
-    elif r < 0.68:
-        return _gen_let_cond(rng)
-    elif r < 0.76:
-        return _gen_deep_arithmetic(rng)
-    elif r < 0.88:
-        return _gen_product(rng)
-    elif r < 0.96:
-        return _gen_seq_let(rng)
+
+def _gen_when(rng):
+    """Family M: when form. (when (pos? x) body) → body or nil"""
+    x = rng.randint(-8, 10)
+    body_val = rng.randint(-5, 15)
+    toks = ["(", "when", "(", "pos?", _num_tok(x), ")", _num_tok(body_val), ")"]
+    result_toks = [_num_tok(body_val)] if x > 0 else ["nil"]
+    return toks, result_toks
+
+
+def _gen_equality(rng):
+    """Family N: equality check. (= a b) → true/false"""
+    choice = rng.random()
+    if choice < 0.4:
+        a = rng.randint(-5, 10)
+        b = a  # equal
     else:
-        return _gen_hof_cross(rng)
+        a = rng.randint(-5, 10)
+        b = rng.randint(-5, 10)
+    toks = ["(", "=", _num_tok(a), _num_tok(b), ")"]
+    return toks, ["true" if a == b else "false"]
+
+
+def _gen_not(rng):
+    """Family O: logical not. (not (pos? x)) → true/false"""
+    x = rng.randint(-8, 10)
+    toks = ["(", "not", "(", "pos?", _num_tok(x), ")", ")"]
+    return toks, ["true" if x <= 0 else "false"]
+
+
+def _gen_expr_only(rng):
+    """Return only expression tokens from a randomly chosen family."""
+    r = rng.random()
+    if r < 0.18:   toks, _ = _gen_arithmetic(rng)
+    elif r < 0.28: toks, _ = _gen_let(rng)
+    elif r < 0.35: toks, _ = _gen_hof(rng)
+    elif r < 0.41: toks, _ = _gen_conditional(rng)
+    elif r < 0.49: toks, _ = _gen_multi_let(rng)
+    elif r < 0.55: toks, _ = _gen_hof_arithmetic(rng)
+    elif r < 0.59: toks, _ = _gen_let_cond(rng)
+    elif r < 0.66: toks, _ = _gen_deep_arithmetic(rng)
+    elif r < 0.75: toks, _ = _gen_product(rng)
+    elif r < 0.82: toks, _ = _gen_seq_let(rng)
+    elif r < 0.86: toks, _ = _gen_hof_cross(rng)
+    elif r < 0.91: toks, _ = _gen_threading(rng)
+    elif r < 0.95: toks, _ = _gen_when(rng)
+    elif r < 0.975: toks, _ = _gen_equality(rng)
+    else:           toks, _ = _gen_not(rng)
+    return toks
+
+
+def _masked_pair(rng):
+    """Mask a contiguous span; replace with a single opaque MASK token.
+
+    The model cannot infer span length from the masked expression, forcing it
+    to predict span content without positional hints.
+    Span length distribution: 1→40%, 2→25%, 3→20%, 4→10%, 5→5%.
+    """
+    expr_toks = _gen_expr_only(rng)
+    n = len(expr_toks)
+    max_span = min(5, max(1, n - 1))  # always leave at least one token visible
+    p = rng.random()
+    if p < 0.40:   span_len = 1
+    elif p < 0.65: span_len = 2
+    elif p < 0.85: span_len = 3
+    elif p < 0.95: span_len = 4
+    else:          span_len = 5
+    span_len = min(span_len, max_span)
+    start = rng.randint(0, n - span_len)
+    target_span = expr_toks[start:start + span_len]
+    # Single opaque MASK regardless of span length
+    masked_expr = expr_toks[:start] + [MASK_STR] + expr_toks[start + span_len:]
+    return masked_expr, target_span, span_len
+
+
+def generate_pair(rng):
+    """Generate one masked (expr_tokens, span_tokens) pair via masked-JEPA.
+
+    The expression has a contiguous span replaced by MASK tokens; the target
+    is the original tokens at those positions.  Span length: 60% single-token,
+    25% two-token, 15% three-token — single-token pairs are used for class
+    accuracy (nearest-neighbour over the 96-token vocabulary).
+    """
+    masked, span, _ = _masked_pair(rng)
+    return masked, span
 
 
 def encode_pair(vocab, expr_toks, res_toks, max_expr=MAX_EXPR_LEN, max_res=MAX_RESULT_LEN):
-    """Encode token lists to padded integer arrays with BOS/EOS framing.
-
-    Masks are stored as float32 to avoid a dtype cast on every batch load.
-    SEP_ID is reserved for future use (e.g. expression/result separator in
-    a joint sequence). EOS_ID terminates each sequence before padding.
-    """
-    expr_ids = [BOS_ID] + vocab.encode(expr_toks) + [EOS_ID]
+    """Encode token lists to padded integer arrays."""
+    expr_ids = [BOS_ID] + vocab.encode(expr_toks)
     expr_ids = expr_ids[:max_expr]
-    expr_mask = [1.0] * len(expr_ids) + [0.0] * (max_expr - len(expr_ids))
+    expr_mask = [1] * len(expr_ids) + [0] * (max_expr - len(expr_ids))
     expr_ids = expr_ids + [PAD_ID] * (max_expr - len(expr_ids))
 
-    res_ids = [BOS_ID] + vocab.encode(res_toks) + [EOS_ID]
+    res_ids = [BOS_ID] + vocab.encode(res_toks)
     res_ids = res_ids[:max_res]
-    res_mask = [1.0] * len(res_ids) + [0.0] * (max_res - len(res_ids))
+    res_mask = [1] * len(res_ids) + [0] * (max_res - len(res_ids))
     res_ids = res_ids + [PAD_ID] * (max_res - len(res_ids))
 
     return (
         np.array(expr_ids, dtype=np.int32),
-        np.array(expr_mask, dtype=np.float32),
+        np.array(expr_mask, dtype=np.int32),
         np.array(res_ids, dtype=np.int32),
-        np.array(res_mask, dtype=np.float32),
+        np.array(res_mask, dtype=np.int32),
     )
 
 
@@ -575,31 +644,36 @@ def encode_pair(vocab, expr_toks, res_toks, max_expr=MAX_EXPR_LEN, max_res=MAX_R
 # ---------------------------------------------------------------------------
 
 def load_val_pairs():
-    """Load cached 2000 validation pairs. Generates and caches on first call."""
+    """Load cached 2000 validation pairs. Generates and caches on first call.
+    Returns (expr, expr_mask, res, res_mask, mask_len).
+    mask_len is the number of tokens masked per pair (1/2/3).
+    """
     if not os.path.exists(VAL_CACHE_PATH):
         _generate_val_cache()
     data = np.load(VAL_CACHE_PATH)
-    return data["expr"], data["expr_mask"], data["res"], data["res_mask"]
+    return data["expr"], data["expr_mask"], data["res"], data["res_mask"], data["mask_len"]
 
 
 def _generate_val_cache():
     os.makedirs(CACHE_DIR, exist_ok=True)
     rng = random.Random(12345)
     vocab = ClojureVocab()
-    exprs, expr_masks, ress, res_masks = [], [], [], []
+    exprs, expr_masks, ress, res_masks, mask_lens = [], [], [], [], []
     for _ in range(N_VAL_PAIRS):
-        et, rt = generate_pair(rng)
-        e, em, r, rm = encode_pair(vocab, et, rt)
+        masked, span, span_len = _masked_pair(rng)
+        e, em, r, rm = encode_pair(vocab, masked, span)
         exprs.append(e)
         expr_masks.append(em)
         ress.append(r)
         res_masks.append(rm)
+        mask_lens.append(span_len)
     np.savez(
         VAL_CACHE_PATH,
         expr=np.stack(exprs),
         expr_mask=np.stack(expr_masks),
         res=np.stack(ress),
         res_mask=np.stack(res_masks),
+        mask_len=np.array(mask_lens, dtype=np.int32),
     )
     print(f"2000 val pairs cached to {VAL_CACHE_PATH}")
 
@@ -608,13 +682,9 @@ def _generate_val_cache():
 # Training dataloader
 # ---------------------------------------------------------------------------
 
-def make_jepa_dataloader(vocab, batch_size, seed=None):
-    """Infinite generator of (expr, expr_mask, res, res_mask) batches.
-
-    seed=None (default) gives non-repeating, non-reproducible training data.
-    Pass an integer seed for fully reproducible training runs.
-    """
-    rng = random.Random(seed)
+def make_jepa_dataloader(vocab, batch_size):
+    """Infinite generator of (expr, expr_mask, res, res_mask) batches."""
+    rng = random.Random()
     while True:
         exprs, expr_masks, ress, res_masks = [], [], [], []
         for _ in range(batch_size):
