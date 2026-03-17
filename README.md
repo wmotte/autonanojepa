@@ -412,7 +412,7 @@ The rise-then-plateau pattern is expected JEPA behaviour: the EMA target encoder
 
 See `program_jepa.md` for the full protocol. In short:
 
-1. Create branch `autoresearch-jepa/<tag>`
+1. Stay on `main` — all commits go directly to main
 2. Edit `train_jepa.py` (hyperparameters at the top, or deeper architectural changes)
 3. Commit → run → grep → log → keep/discard
 

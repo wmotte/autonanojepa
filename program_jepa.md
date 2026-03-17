@@ -7,14 +7,13 @@ Adapted from `program.md`. The editable file is `train_jepa.py`; `prepare_jepa.p
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar16`). The branch `autoresearch-jepa/<tag>` must not already exist.
-2. **Create the branch**: `git checkout -b autoresearch-jepa/<tag>` from current main.
-3. **Read the in-scope files**:
+1. **Ensure you are on main**: `git checkout main && git pull origin main`.
+2. **Read the in-scope files**:
    - `prepare_jepa.py` — fixed: vocab, data generator, val cache, dataloader. Do not modify.
    - `train_jepa.py` — the file you modify: model architecture, loss, optimizer, hyperparameters.
-4. **Verify val cache**: Check `~/.cache/autoresearch_jepa/val_pairs_v2.npz` exists. If not: `uv run prepare_jepa.py`.
-5. **Initialize results_jepa.tsv**: Run `uv run train_jepa.py` once to establish baseline.
-6. **Confirm and go**.
+3. **Verify val cache**: Check `~/.cache/autoresearch_jepa/val_pairs_v2.npz` exists. If not: `uv run prepare_jepa.py`.
+4. **Initialize results_jepa.tsv**: Run `uv run train_jepa.py` once to establish baseline.
+5. **Confirm and go**.
 
 ## Task
 
@@ -75,18 +74,18 @@ commit	val_recall_at_1	memory_gb	status	description
 
 ## The experiment loop
 
-Branch: `autoresearch-jepa/<tag>`
+Branch: `main` — commit all changes directly to main.
 
 LOOP FOREVER:
 
-1. Check git state (branch/commit).
+1. Check git state: `git status` — confirm you are on `main`.
 2. Modify `train_jepa.py` with an experimental idea.
-3. `git add autoresearch-mlx/train_jepa.py && git commit -m "experiment: <description>"`
+3. `git add train_jepa.py && git commit -m "experiment: <description>"`
 4. Run: `uv run train_jepa.py > run.log 2>&1`
 5. Check: `grep "^val_recall_at_1_pct:\|^peak_vram_mb:" run.log`
 6. If empty → crashed. Run `tail -n 50 run.log` for stack trace.
 7. Record in `results_jepa.tsv`.
-8. If `val_recall_at_1_pct` **improved** (higher): `git add autoresearch-mlx/results_jepa.tsv && git commit --amend --no-edit`
+8. If `val_recall_at_1_pct` **improved** (higher): `git add results_jepa.tsv && git commit --amend --no-edit`
 9. If equal or worse: record hash, then `git reset --hard <previous kept commit>`
 
 **Timeout**: ~3 min per experiment. Kill and discard if >8 min.
