@@ -36,9 +36,9 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # ---------------------------------------------------------------------------
 
 N_EMBD = 160
-DEPTH = 5
+DEPTH = 4
 N_HEAD = 4            # 160 // 4 = 40 (even for RoPE)
-EMA_TAU = 0.999
+EMA_TAU = 0.9995  # Slower EMA target update
 VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 0.5
 VICREG_COV = 0.1        # Covariance regularization weight (decorrelates z_ctx dims)
