@@ -24,7 +24,7 @@ TIME_BUDGET = 120
 N_VAL_PAIRS = 2000
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch_jepa")
-VAL_CACHE_PATH = os.path.join(CACHE_DIR, "val_pairs_v4.npz")
+VAL_CACHE_PATH = os.path.join(CACHE_DIR, "val_pairs_v5.npz")
 
 # ---------------------------------------------------------------------------
 # Vocabulary
@@ -513,7 +513,7 @@ def _gen_hof_cross(rng):
 def _gen_threading(rng):
     """Family L: threading macro. (-> start (op arg) ...) → result"""
     start = rng.randint(-5, 10)
-    n_steps = rng.randint(1, 3)
+    n_steps = rng.randint(1, 5)
     toks = ["(", "->", _num_tok(start)]
     result = start
     for _ in range(n_steps):
@@ -562,23 +562,162 @@ def _gen_not(rng):
     return toks, ["true" if x <= 0 else "false"]
 
 
+def _gen_map_fn(rng):
+    """Family P: map with anonymous fn. (map (fn [x] body) [elems]) — 14-18 tokens."""
+    op = rng.choice(["inc", "dec", "abs", "+", "-", "*"])
+    n = rng.randint(2, 5)
+    elems = [rng.randint(-3, 8) for _ in range(n)]
+    if op in ["inc", "dec", "abs"]:
+        body_toks = ["(", op, "x", ")"]
+    else:
+        k = rng.randint(1, 4)
+        body_toks = ["(", op, "x", _num_tok(k), ")"]
+    toks = (["(", "map", "(", "fn", "[", "x", "]"] + body_toks +
+            [")", "["] + [_num_tok(e) for e in elems] + ["]", ")"])
+    return toks, ["nil"]  # result is a collection; ignored in masked-JEPA
+
+
+def _gen_filter_fn(rng):
+    """Family Q: filter with anonymous fn. (filter (fn [x] pred) [elems]) — 16-21 tokens."""
+    n = rng.randint(3, 6)
+    elems = [rng.randint(-5, 8) for _ in range(n)]
+    if rng.random() < 0.5:
+        pred_toks = ["(", "pos?", "x", ")"]
+    else:
+        op = rng.choice(["+", "-"])
+        k = rng.randint(1, 4)
+        pred_toks = ["(", "pos?", "(", op, "x", _num_tok(k), ")", ")"]
+    toks = (["(", "filter", "(", "fn", "[", "x", "]"] + pred_toks +
+            [")", "["] + [_num_tok(e) for e in elems] + ["]", ")"])
+    return toks, ["nil"]  # result is a collection; ignored in masked-JEPA
+
+
+def _gen_reduce_fn(rng):
+    """Family R: reduce with anonymous fn. (reduce (fn [a b] op) init [elems]) — 17-20 tokens."""
+    op = rng.choice(["+", "*", "max", "min"])
+    n = rng.randint(2, 4)
+    elems = [rng.randint(1, 6) for _ in range(n)]
+    init_val = 0 if op == "+" else 1 if op == "*" else 0 if op == "max" else 30
+    result = init_val
+    for e in elems:
+        if op == "+":   result += e
+        elif op == "*": result *= e
+        elif op == "max": result = max(result, e)
+        elif op == "min": result = min(result, e)
+    result = max(-10, min(30, result))
+    toks = (["(", "reduce", "(", "fn", "[", "a", "b", "]", "(", op, "a", "b", ")", ")",
+             _num_tok(init_val), "["] + [_num_tok(e) for e in elems] + ["]", ")"])
+    return toks, [_num_tok(result)]
+
+
+def _gen_nested_let(rng):
+    """Family S: nested let. (let [x v] (let [y (op x k)] (body y))) — 17-20 tokens."""
+    var1 = rng.choice(["x", "a", "n"])
+    var2 = rng.choice(["y", "b", "m"])
+    v1 = rng.randint(-3, 8)
+    op1 = rng.choice(["+", "-", "*", "inc", "dec"])
+    if op1 in ["inc", "dec"]:
+        v2 = v1 + (1 if op1 == "inc" else -1)
+        bind2_toks = ["(", op1, var1, ")"]
+    else:
+        k1 = rng.randint(1, 4)
+        v2 = v1 + k1 if op1 == "+" else v1 - k1 if op1 == "-" else v1 * k1
+        v2 = max(-10, min(30, v2))
+        bind2_toks = ["(", op1, var1, _num_tok(k1), ")"]
+    op2 = rng.choice(["+", "-", "*", "inc", "dec"])
+    if op2 in ["inc", "dec"]:
+        result = v2 + (1 if op2 == "inc" else -1)
+        body_toks = ["(", op2, var2, ")"]
+    else:
+        k2 = rng.randint(1, 4)
+        result = v2 + k2 if op2 == "+" else v2 - k2 if op2 == "-" else v2 * k2
+        result = max(-10, min(30, result))
+        body_toks = ["(", op2, var2, _num_tok(k2), ")"]
+    toks = (["(", "let", "[", var1, _num_tok(v1), "]",
+             "(", "let", "[", var2] + bind2_toks + ["]"] + body_toks + [")", ")"])
+    return toks, [_num_tok(result)]
+
+
+def _gen_triple_let(rng):
+    """Family T: three-binding let. (let [x v1 y v2 z (op x y)] body) — 16-19 tokens."""
+    var1, var2, var3 = rng.sample(["x", "y", "z", "a", "b", "n"], 3)
+    v1 = rng.randint(-3, 8)
+    v2 = rng.randint(-3, 8)
+    op_b = rng.choice(["+", "-", "*", "max", "min"])
+    v3 = (v1 + v2 if op_b == "+" else v1 - v2 if op_b == "-" else
+          v1 * v2 if op_b == "*" else max(v1, v2) if op_b == "max" else min(v1, v2))
+    v3 = max(-10, min(30, v3))
+    op_body = rng.choice(["+", "-", "inc", "dec"])
+    if op_body in ["inc", "dec"]:
+        result = v3 + (1 if op_body == "inc" else -1)
+        body_toks = ["(", op_body, var3, ")"]
+    else:
+        k = rng.randint(1, 4)
+        result = v3 + k if op_body == "+" else v3 - k
+        body_toks = ["(", op_body, var3, _num_tok(k), ")"]
+    result = max(-10, min(30, result))
+    toks = (["(", "let", "[",
+             var1, _num_tok(v1), var2, _num_tok(v2),
+             var3, "(", op_b, var1, var2, ")",
+             "]"] + body_toks + [")"])
+    return toks, [_num_tok(result)]
+
+
+def _gen_cond_form(rng):
+    """Family U: cond with two predicates. (let [x v] (cond p1 e1 p2 e2 true e3)) — 22-25 tokens."""
+    var = rng.choice(["x", "n", "a"])
+    v = rng.randint(-8, 10)
+    e1 = rng.randint(2, 10)
+    e2 = rng.randint(-3, 2)
+    e3 = rng.randint(-8, -1)
+    result = e1 if v > 0 else e2 if v == 0 else e3
+    result = max(-10, min(30, result))
+    toks = ["(", "let", "[", var, _num_tok(v), "]",
+            "(", "cond",
+            "(", "pos?", var, ")", _num_tok(e1),
+            "(", "pos?", "(", "inc", var, ")", ")", _num_tok(e2),
+            "true", _num_tok(e3),
+            ")", ")"]
+    return toks, [_num_tok(result)]
+
+
 def _gen_expr_only(rng):
-    """Return only expression tokens from a randomly chosen family."""
+    """Return only expression tokens from a randomly chosen family.
+
+    Short forms (A-O): ~60%   Long forms (P-U, threading): ~40%
+      A arithmetic        12%    P map-fn             7%
+      B let                8%    Q filter-fn          4%
+      C hof                5%    R reduce-fn          3%
+      D conditional        4%    S nested-let         5%
+      E multi-let          6%    T triple-let         4%
+      F hof-arithmetic     4%    U cond-form          3%
+      G let-cond           3%    L threading (1-5)    5%
+      H deep-arith         5%    M when               3%
+      I product            6%    N equality           2%
+      J seq-let            5%    O not                2%
+      K hof-cross          3%
+    """
     r = rng.random()
-    if r < 0.18:   toks, _ = _gen_arithmetic(rng)
-    elif r < 0.28: toks, _ = _gen_let(rng)
-    elif r < 0.35: toks, _ = _gen_hof(rng)
-    elif r < 0.41: toks, _ = _gen_conditional(rng)
-    elif r < 0.49: toks, _ = _gen_multi_let(rng)
-    elif r < 0.55: toks, _ = _gen_hof_arithmetic(rng)
-    elif r < 0.59: toks, _ = _gen_let_cond(rng)
-    elif r < 0.66: toks, _ = _gen_deep_arithmetic(rng)
-    elif r < 0.75: toks, _ = _gen_product(rng)
-    elif r < 0.82: toks, _ = _gen_seq_let(rng)
-    elif r < 0.86: toks, _ = _gen_hof_cross(rng)
-    elif r < 0.91: toks, _ = _gen_threading(rng)
+    if r < 0.12:   toks, _ = _gen_arithmetic(rng)
+    elif r < 0.20: toks, _ = _gen_let(rng)
+    elif r < 0.25: toks, _ = _gen_hof(rng)
+    elif r < 0.29: toks, _ = _gen_conditional(rng)
+    elif r < 0.35: toks, _ = _gen_multi_let(rng)
+    elif r < 0.39: toks, _ = _gen_hof_arithmetic(rng)
+    elif r < 0.42: toks, _ = _gen_let_cond(rng)
+    elif r < 0.47: toks, _ = _gen_deep_arithmetic(rng)
+    elif r < 0.53: toks, _ = _gen_product(rng)
+    elif r < 0.58: toks, _ = _gen_seq_let(rng)
+    elif r < 0.61: toks, _ = _gen_hof_cross(rng)
+    elif r < 0.68: toks, _ = _gen_map_fn(rng)
+    elif r < 0.72: toks, _ = _gen_filter_fn(rng)
+    elif r < 0.75: toks, _ = _gen_reduce_fn(rng)
+    elif r < 0.80: toks, _ = _gen_nested_let(rng)
+    elif r < 0.84: toks, _ = _gen_triple_let(rng)
+    elif r < 0.87: toks, _ = _gen_cond_form(rng)
+    elif r < 0.92: toks, _ = _gen_threading(rng)
     elif r < 0.95: toks, _ = _gen_when(rng)
-    elif r < 0.975: toks, _ = _gen_equality(rng)
+    elif r < 0.97: toks, _ = _gen_equality(rng)
     else:           toks, _ = _gen_not(rng)
     return toks
 
