@@ -213,12 +213,57 @@ Uses the `->` threading macro. The value threads through each step; tests whethe
 ```
 Simple equality check; result is boolean. Tests the model's ability to predict `true`/`false` from numeric comparison.
 
-### O — Logical not (1.5%)
+### O — Logical not (2%)
 ```clojure
 (not (pos? -3))                  → true
 (not (pos? 5))                   → false
 ```
 Logical negation of a `pos?` predicate.
+
+### P — map with fn (7%) — 14–18 tokens
+```clojure
+(map (fn [x] (inc x)) [1 2 3 4])      → [2 3 4 5]
+(map (fn [x] (+ x 2)) [3 -1 5])       → [5 1 7]
+(map (fn [x] (* x 3)) [1 2 3])        → [3 6 9]
+```
+Anonymous function mapped over a literal vector. The result is a collection; in masked-JEPA the execution result is irrelevant — the masked span is the prediction target.
+
+### Q — filter with fn (4%) — 16–21 tokens
+```clojure
+(filter (fn [x] (pos? x)) [1 -2 3 -4 5])         → [1 3 5]
+(filter (fn [x] (pos? (+ x 2))) [0 -1 -3 1])     → [0 1]
+```
+Filters a vector by an anonymous predicate. Longer than map; the predicate can include arithmetic.
+
+### R — reduce with fn (3%) — 17–20 tokens
+```clojure
+(reduce (fn [a b] (+ a b)) 0 [1 2 3 4])    → 10
+(reduce (fn [a b] (* a b)) 1 [2 3 4])      → 24
+(reduce (fn [a b] (max a b)) 0 [3 1 5 2])  → 5
+```
+Explicit three-argument `reduce` with an anonymous combining function. The initial value is always present.
+
+### S — nested let (5%) — 17–20 tokens
+```clojure
+(let [x 3] (let [y (+ x 2)] (* y 4)))    → 20
+(let [a 4] (let [b (inc a)] (- b 3)))    → 2
+```
+Two nested `let` bindings; the inner binding refers to the outer variable.
+
+### T — triple let (4%) — 16–19 tokens
+```clojure
+(let [x 2 y 3 z (+ x y)] (inc z))        → 6
+(let [a 4 b 2 c (* a b)] (+ c 5))        → 13
+```
+Three bindings in one `let`; the third binding computes from the first two.
+
+### U — cond form (3%) — 22–25 tokens
+```clojure
+(let [x 5]  (cond (pos? x) 8 (pos? (inc x)) 1 true -3))  → 8
+(let [n -1] (cond (pos? n) 8 (pos? (inc n)) 1 true -3))  → 1
+(let [a -5] (cond (pos? a) 8 (pos? (inc a)) 1 true -3))  → -3
+```
+Multi-branch `cond` inside a `let`. The longest family at ~24 tokens; the three branches exercise different evaluation paths through the same expression structure.
 
 ---
 
@@ -243,6 +288,63 @@ uv run train_jepa.py
 ```
 
 No data downloads. No internet access required after setup. The validation set is deterministic (seed=12345) and cached at `~/.cache/autoresearch_jepa/val_pairs_v5.npz`.
+
+### Sample training pairs
+
+Each training sample is a masked Clojure expression paired with the hidden span. The number in parentheses is the span length; the model does not see it — only a single `MASK` token appears in the expression regardless.
+
+```
+masked expression                                           → target span
+─────────────────────────────────────────────────────────────────────────
+( let [ y MASK if ( pos? y ) 3 -4 ) )              (3)  →  11 ] (
+( reduce ( fn [ a MASK ( + a b ) ) 0 [ 4 2 4 6 ] ) (2)  →  b ]
+( let [ a 7 ] ( let [ b ( - a 2 ) ] ( inc MASK )   (3)  →  b ) )
+( let [ b MASK 10 ] ( * b m ) )                    (2)  →  -3 m
+( MASK y 4 b ( + y 3 ) ] ( dec b ) )               (2)  →  let [
+( inc MASK first [ 9 0 11 ] ) )                    (1)  →  (
+( MASK ] ( * x x ) )                               (4)  →  let [ x 2
+( let [ b -5 ] MASK max b 2 ) )                    (1)  →  (
+( last [ MASK 1 ] )                                (1)  →  15
+( let [ MASK -3 z -1 a ( min y z ) ] ( - a 4 ) )   (1)  →  y
+```
+
+Span lengths 1–5 are sampled at 40/25/20/10/5%. Single-token masks (like rows 6, 8, 9, 10) are used for the `val_class_acc_pct` metric; longer masks (rows 1–5, 7) create harder prediction tasks that force the model to reason about structural context.
+
+### What the training loop does
+
+Each step draws a fresh batch of masked Clojure expressions. For every expression in the batch a random span has already been replaced by a single opaque `MASK` token; the original tokens of that span are the target:
+
+```python
+# One training step (simplified from train_jepa.py)
+
+# 1. Encode the masked expression → context embedding
+z_ctx  = model.ctx_encoder(expr_tokens, expr_mask)   # (B, D)
+
+# 2. Predict the target embedding from context
+z_pred = model.predict(z_ctx)                         # (B, D)
+
+# 3. Encode the masked span with the EMA target encoder (no gradients)
+z_tgt  = target_enc(span_tokens, span_mask)           # (B, D)  stop_gradient
+
+# 4. Cosine loss: push predicted embedding toward target
+z_pred_n = normalize(z_pred)
+z_tgt_n  = normalize(z_tgt)
+loss = 1.0 - mean(dot(z_pred_n, z_tgt_n))
+
+# 5. VICReg: prevent dimensional collapse of z_pred and z_ctx
+loss += VICREG_LAMBDA * (variance_penalty(z_pred) + variance_penalty(z_ctx))
+loss += VICREG_COV    * covariance_penalty(z_ctx)
+
+# 6. Symmetric JEPA: also predict expression embedding from span embedding
+z_rev  = model.predict_reverse(z_tgt)
+loss  += 0.5 * (1.0 - mean(dot(normalize(z_rev), normalize(z_ctx))))
+
+# 7. Gradient step on model; EMA update of target encoder (no gradients)
+optimizer.update(model, grads)
+target_enc ← τ · target_enc + (1−τ) · model.ctx_encoder   # τ = 0.999
+```
+
+The target encoder is updated only through the EMA — it never receives gradients directly. This prevents trivial solutions: the predictor cannot simply copy the input because the target keeps evolving as the EMA slowly pulls it toward the context encoder.
 
 ---
 
