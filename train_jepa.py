@@ -35,9 +35,9 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # Hyperparameters (editable by autoresearch loop)
 # ---------------------------------------------------------------------------
 
-N_EMBD = 320
-DEPTH = 4
-N_HEAD = 5            # 320 // 5 = 64
+N_EMBD = 384
+DEPTH = 5
+N_HEAD = 6            # 384 // 6 = 64
 EMA_TAU = 0.999
 VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 0.5
