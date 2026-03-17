@@ -1,5 +1,7 @@
 # nanoJEPA — Clojure Masked-JEPA on Apple Silicon
 
+> Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch)
+
 An MLX implementation of a Joint Embedding Predictive Architecture (JEPA) whose task is **masked code understanding**: given a Clojure expression with a span of tokens replaced by a single opaque `MASK`, predict the embedding of the masked span — without ever generating tokens.
 
 This runs natively on Apple Silicon via MLX (unified memory, no PyTorch, no CUDA). The autoresearch loop (`program_jepa.md`) iteratively improves the model within a fixed time budget.
