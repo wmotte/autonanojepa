@@ -4,3 +4,20 @@ commit	val_recall_at_1	memory_gb	status	description
 d4caa16	1.7000	0.9	keep	MATRIX_LR=0.0005, EMA_TAU=0.999
 3e77ae7	1.8500	0.9	keep	EMB_LR=0.005, GAMMA=0.2
 e9695ae	1.8500	0.9	keep	EMA_TAU=0.9995, LAMBDA=0.5, COV=0.05
+3bbe85a	59.5579	2.0	keep	increase capacity (N_EMBD=384, DEPTH=5, N_HEAD=6)
+f67f597	66.9701	1.8	keep	reduce memory (N_EMBD=256, BS=48)
+4ef4d88	68.0104	1.1	keep	reduce memory (N_EMBD=192, DEPTH=4, BS=32)
+f6ed905	68.2705	1.1	keep	BS=24 to fit under 1GB
+e858e15	67.4902	0.9	keep	N_EMBD=160, N_HEAD=5 (under 1GB)
+cc9ce98	68.1404	0.9	keep	N_EMBD=160, BS=28
+87e912f	67.3602	0.9	keep	N_EMBD=160, BS=32
+603587a	68.7906	1.0	keep	N_EMBD=176, BS=28 (over 1GB)
+16e4b80	69.4408	1.0	keep	N_EMBD=168, BS=28 (over 1GB)
+3970c7c	0.0000	0.0	crash	N_EMBD=164 (odd head dim)
+c0725a3	67.8804	0.9	keep	N_EMBD=160, N_HEAD=4, BS=28
+b5eac02	66.8401	1.0	keep	N_EMBD=168, BS=24 (over 1GB)
+cff51b0	67.4902	1.2	keep	N_EMBD=160, DEPTH=5 (over 1GB)
+1c9d6cd	68.5306	0.9	keep	N_EMBD=160, EMA_TAU=0.9995, BS=28 (BEST under 1GB)
+019f1d0	60.9883	0.9	discard	GAMMA=0.2, COV=0.05 (collapse)
+eaf8674	68.0104	0.9	keep	SUBEXPR_WEIGHT=0.5
+20fcfb7	67.4902	1.0	keep	N_EMBD=176, BS=24 (over 1GB)

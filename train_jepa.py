@@ -35,15 +35,15 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # Hyperparameters (editable by autoresearch loop)
 # ---------------------------------------------------------------------------
 
-N_EMBD = 176
+N_EMBD = 160
 DEPTH = 4
-N_HEAD = 4            # 176 // 4 = 44 (even for RoPE)
+N_HEAD = 4            # 160 // 4 = 40 (even for RoPE)
 EMA_TAU = 0.9995  # Slower EMA target update
 VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 0.5
 VICREG_COV = 0.1        # Covariance regularization weight (decorrelates z_ctx dims)
 SUBEXPR_WEIGHT = 0.25   # Sub-expression auxiliary loss weight (Gap 2)
-DEVICE_BATCH_SIZE = 24  # Reduced for N_EMBD=176
+DEVICE_BATCH_SIZE = 28  # Best batch size for time budget
 MATRIX_LR = 0.0005
 EMBEDDING_LR = 0.005
 WEIGHT_DECAY = 0.01
