@@ -1,1 +1,3 @@
 commit	val_recall_at_1	memory_gb	status	description
+4f0c457	94.0758	1.0	keep	baseline: increased data complexity (50/50 split, families V/W/X, threading *)
+787ed95	89.8104	1.0	discard	debiased InfoNCE: false-neg masking by result token ID — weakened contrastive gradient
