@@ -571,33 +571,51 @@ def _gen_not(rng):
 
 
 def _gen_map_fn(rng):
-    """Family P: map with anonymous fn. (map (fn [x] body) [elems]) — 14-18 tokens."""
+    """Family P: map with anonymous fn — returns actual mapped vector.
+    (map (fn [x] (inc x)) [1 2 3]) → [2 3 4]
+    Result is a vector: ["[", "2", "3", "4", "]"] — at most 4 elements.
+    """
     op = rng.choice(["inc", "dec", "abs", "+", "-", "*"])
-    n = rng.randint(2, 5)
+    n = rng.randint(2, 4)  # cap at 4 so result fits MAX_RESULT_LEN=8
     elems = [rng.randint(-3, 8) for _ in range(n)]
     if op in ["inc", "dec", "abs"]:
         body_toks = ["(", op, "x", ")"]
+        if op == "inc":   mapped = [e + 1 for e in elems]
+        elif op == "dec": mapped = [e - 1 for e in elems]
+        else:             mapped = [abs(e) for e in elems]
     else:
         k = rng.randint(1, 4)
         body_toks = ["(", op, "x", _num_tok(k), ")"]
+        if op == "+":   mapped = [e + k for e in elems]
+        elif op == "-": mapped = [e - k for e in elems]
+        else:           mapped = [e * k for e in elems]
+    mapped = [max(-10, min(30, m)) for m in mapped]
     toks = (["(", "map", "(", "fn", "[", "x", "]"] + body_toks +
             [")", "["] + [_num_tok(e) for e in elems] + ["]", ")"])
-    return toks, ["nil"]  # result is a collection; ignored in masked-JEPA
+    result_toks = ["["] + [_num_tok(m) for m in mapped] + ["]"]
+    return toks, result_toks
 
 
 def _gen_filter_fn(rng):
-    """Family Q: filter with anonymous fn. (filter (fn [x] pred) [elems]) — 16-21 tokens."""
-    n = rng.randint(3, 6)
-    elems = [rng.randint(-5, 8) for _ in range(n)]
-    if rng.random() < 0.5:
+    """Family Q: filter with anonymous fn — returns actual filtered vector.
+    (filter (fn [x] (pos? x)) [1 -2 3 -4]) → [1 3]
+    Result is a vector (possibly empty []).  At most 4 input elements.
+    """
+    n = rng.randint(2, 4)  # cap input so result fits MAX_RESULT_LEN=8
+    elems = [rng.randint(-4, 8) for _ in range(n)]
+    if rng.random() < 0.6:
         pred_toks = ["(", "pos?", "x", ")"]
+        filtered = [e for e in elems if e > 0]
     else:
         op = rng.choice(["+", "-"])
         k = rng.randint(1, 4)
         pred_toks = ["(", "pos?", "(", op, "x", _num_tok(k), ")", ")"]
+        filtered = [e for e in elems if (e + k if op == "+" else e - k) > 0]
+    filtered = [max(-10, min(30, f)) for f in filtered]
     toks = (["(", "filter", "(", "fn", "[", "x", "]"] + pred_toks +
             [")", "["] + [_num_tok(e) for e in elems] + ["]", ")"])
-    return toks, ["nil"]  # result is a collection; ignored in masked-JEPA
+    result_toks = ["["] + [_num_tok(f) for f in filtered] + ["]"]
+    return toks, result_toks
 
 
 def _gen_reduce_fn(rng):
@@ -790,6 +808,121 @@ def _gen_depth4_arith(rng):
     return toks, [_num_tok(result)]
 
 
+def _gen_var_shadow(rng):
+    """Family DD: variable shadowing — inner let rebinds the same name.
+    (let [x 3] (let [x (+ x 1)] x))         → 4
+    (let [x 5] (let [x (* x 2)] (inc x)))    → 11
+    Model must track which binding of x is active in each scope.
+    Paren depth 4-5.  ~19-24 tokens.
+    """
+    var = rng.choice(["x", "n", "a"])
+    v1 = rng.randint(1, 8)
+
+    # Inner binding: rebind same var using outer var's value
+    op1 = rng.choice(["+", "-", "*", "inc", "dec"])
+    if op1 in ["inc", "dec"]:
+        v2 = v1 + (1 if op1 == "inc" else -1)
+        bind_toks = ["(", op1, var, ")"]
+    else:
+        k1 = rng.randint(1, 4)
+        v2 = v1 + k1 if op1 == "+" else v1 - k1 if op1 == "-" else v1 * k1
+        bind_toks = ["(", op1, var, _num_tok(k1), ")"]
+    v2 = max(-10, min(30, v2))
+
+    # Body: use the shadowed var (possibly with another op)
+    if rng.random() < 0.35:
+        result = v2
+        body_toks = [var]  # just return the inner var
+    else:
+        op2 = rng.choice(["+", "-", "*", "inc", "dec"])
+        if op2 in ["inc", "dec"]:
+            result = v2 + (1 if op2 == "inc" else -1)
+            body_toks = ["(", op2, var, ")"]
+        else:
+            k2 = rng.randint(1, 4)
+            result = v2 + k2 if op2 == "+" else v2 - k2 if op2 == "-" else v2 * k2
+            body_toks = ["(", op2, var, _num_tok(k2), ")"]
+
+    result = max(-10, min(30, int(round(result))))
+    toks = (["(", "let", "[", var, _num_tok(v1), "]",
+             "(", "let", "[", var] + bind_toks + ["]"] + body_toks + [")", ")"])
+    return toks, [_num_tok(result)]
+
+
+def _gen_seq_let3(rng):
+    """Family EE: three-binding sequential let, each binding uses the previous var.
+    (let [a 3 b (* a 2) c (+ b 1)] (inc c)) → 8
+    Three-step dependent computation chain; result never appears as a literal.
+    ~21-25 tokens.
+    """
+    var1, var2, var3 = rng.sample(["a", "b", "n", "x", "y", "z"], 3)
+    v1 = rng.randint(2, 5)
+
+    # Second binding: f(var1)
+    op1 = rng.choice(["+", "*"])
+    k1 = rng.randint(2, 3)
+    v2 = v1 + k1 if op1 == "+" else v1 * k1
+    v2 = max(-10, min(30, v2))
+
+    # Third binding: g(var2)
+    op2 = rng.choice(["+", "-", "*"])
+    k2 = rng.randint(1, 3)
+    v3 = v2 + k2 if op2 == "+" else v2 - k2 if op2 == "-" else v2 * k2
+    v3 = max(-10, min(30, v3))
+
+    # Body: h(var3)
+    body_op = rng.choice(["+", "-", "inc", "dec"])
+    if body_op in ["inc", "dec"]:
+        result = v3 + (1 if body_op == "inc" else -1)
+        body_toks = ["(", body_op, var3, ")"]
+    else:
+        k3 = rng.randint(1, 3)
+        result = v3 + k3 if body_op == "+" else v3 - k3
+        body_toks = ["(", body_op, var3, _num_tok(k3), ")"]
+
+    result = max(-10, min(30, int(round(result))))
+    toks = (["(", "let", "[",
+             var1, _num_tok(v1),
+             var2, "(", op1, var1, _num_tok(k1), ")",
+             var3, "(", op2, var2, _num_tok(k2), ")",
+             "]"] + body_toks + [")"])
+    return toks, [_num_tok(result)]
+
+
+def _gen_thread_last(rng):
+    """Family FF: ->> threading — value inserted as LAST argument.
+    (->> 5 (- 3)) → (- 3 5) = -2   (differs from -> where result = (- 5 3) = 2)
+    (->> 2 (* 3) (+ 4)) → (* 3 2)=6, (+ 4 6)=10
+    Tests whether model distinguishes ->> from -> via argument order.
+    ~7-19 tokens.
+    """
+    start = rng.randint(-3, 8)
+    n_steps = rng.randint(1, 4)
+    toks = ["(", "->>", _num_tok(start)]
+    result = start
+    for _ in range(n_steps):
+        op = rng.choice(["inc", "dec", "+", "-", "*"])
+        if op == "inc":
+            result += 1
+            toks += ["(", "inc", ")"]
+        elif op == "dec":
+            result -= 1
+            toks += ["(", "dec", ")"]
+        elif op == "*":
+            k = rng.randint(2, 3)
+            result = k * result  # (* k result) — same numerically as (* result k)
+            toks += ["(", "*", _num_tok(k), ")"]
+        else:
+            k = rng.randint(1, 5)
+            # ->> inserts value as LAST arg: (->> v (- k)) → (- k v) = k - v
+            result = (k + result) if op == "+" else (k - result)
+            toks += ["(", op, _num_tok(k), ")"]
+        result = max(-10, min(30, result))
+    toks.append(")")
+    result = max(-10, min(30, result))
+    return toks, [_num_tok(result)]
+
+
 def _gen_let_threading(rng):
     """Family Y: threading macro result bound in let, then used in body.
     (let [x (-> v (+ 2) (* 3))] (+ x 1)) — cross-family composition.
@@ -968,35 +1101,38 @@ def _gen_vector_result(rng):
 def _gen_expr_only(rng):
     """Return only expression tokens from a randomly chosen family."""
     r = rng.random()
-    if r < 0.06:   toks, _ = _gen_arithmetic(rng)
-    elif r < 0.09: toks, _ = _gen_let(rng)
-    elif r < 0.13: toks, _ = _gen_hof(rng)
-    elif r < 0.16: toks, _ = _gen_conditional(rng)
-    elif r < 0.21: toks, _ = _gen_multi_let(rng)
-    elif r < 0.24: toks, _ = _gen_hof_arithmetic(rng)
-    elif r < 0.26: toks, _ = _gen_let_cond(rng)
-    elif r < 0.28: toks, _ = _gen_deep_arithmetic(rng)
-    elif r < 0.33: toks, _ = _gen_product(rng)
-    elif r < 0.37: toks, _ = _gen_seq_let(rng)
-    elif r < 0.39: toks, _ = _gen_hof_cross(rng)
-    elif r < 0.44: toks, _ = _gen_map_fn(rng)
-    elif r < 0.48: toks, _ = _gen_filter_fn(rng)
-    elif r < 0.51: toks, _ = _gen_reduce_fn(rng)
-    elif r < 0.55: toks, _ = _gen_nested_let(rng)
-    elif r < 0.59: toks, _ = _gen_triple_let(rng)
-    elif r < 0.62: toks, _ = _gen_cond_form(rng)
-    elif r < 0.67: toks, _ = _gen_threading(rng)
-    elif r < 0.70: toks, _ = _gen_when(rng)
-    elif r < 0.73: toks, _ = _gen_equality(rng)
-    elif r < 0.76: toks, _ = _gen_not(rng)
-    elif r < 0.80: toks, _ = _gen_let_hof(rng)
-    elif r < 0.83: toks, _ = _gen_let_cond_composed(rng)
-    elif r < 0.86: toks, _ = _gen_depth4_arith(rng)
-    elif r < 0.89: toks, _ = _gen_let_threading(rng)
-    elif r < 0.92: toks, _ = _gen_threading_cond(rng)
-    elif r < 0.95: toks, _ = _gen_triple_nested_let(rng)
-    elif r < 0.97: toks, _ = _gen_let_dual_hof(rng)
-    else:           toks, _ = _gen_vector_result(rng)
+    if r < 0.05:   toks, _ = _gen_arithmetic(rng)
+    elif r < 0.07: toks, _ = _gen_let(rng)
+    elif r < 0.10: toks, _ = _gen_hof(rng)
+    elif r < 0.12: toks, _ = _gen_conditional(rng)
+    elif r < 0.16: toks, _ = _gen_multi_let(rng)
+    elif r < 0.18: toks, _ = _gen_hof_arithmetic(rng)
+    elif r < 0.20: toks, _ = _gen_let_cond(rng)
+    elif r < 0.22: toks, _ = _gen_deep_arithmetic(rng)
+    elif r < 0.26: toks, _ = _gen_product(rng)
+    elif r < 0.29: toks, _ = _gen_seq_let(rng)
+    elif r < 0.31: toks, _ = _gen_hof_cross(rng)
+    elif r < 0.35: toks, _ = _gen_threading(rng)
+    elif r < 0.38: toks, _ = _gen_when(rng)
+    elif r < 0.41: toks, _ = _gen_equality(rng)
+    elif r < 0.44: toks, _ = _gen_not(rng)
+    elif r < 0.48: toks, _ = _gen_map_fn(rng)
+    elif r < 0.51: toks, _ = _gen_filter_fn(rng)
+    elif r < 0.54: toks, _ = _gen_reduce_fn(rng)
+    elif r < 0.57: toks, _ = _gen_nested_let(rng)
+    elif r < 0.60: toks, _ = _gen_triple_let(rng)
+    elif r < 0.63: toks, _ = _gen_cond_form(rng)
+    elif r < 0.66: toks, _ = _gen_let_hof(rng)
+    elif r < 0.69: toks, _ = _gen_let_cond_composed(rng)
+    elif r < 0.72: toks, _ = _gen_depth4_arith(rng)
+    elif r < 0.75: toks, _ = _gen_let_threading(rng)
+    elif r < 0.78: toks, _ = _gen_threading_cond(rng)
+    elif r < 0.81: toks, _ = _gen_triple_nested_let(rng)
+    elif r < 0.84: toks, _ = _gen_let_dual_hof(rng)
+    elif r < 0.88: toks, _ = _gen_vector_result(rng)
+    elif r < 0.92: toks, _ = _gen_var_shadow(rng)
+    elif r < 0.96: toks, _ = _gen_seq_let3(rng)
+    else:           toks, _ = _gen_thread_last(rng)
     return toks
 
 
@@ -1027,57 +1163,61 @@ def _masked_pair(rng):
 def generate_pair(rng):
     """Generate one actual (expression, result) execution pair.
 
-    Returns (expr_tokens, result_tokens) where result_tokens is the computed
-    value of evaluating the expression. Families P (map-fn) and Q (filter-fn)
-    are excluded — their results are lazy collections represented as nil,
-    which creates degenerate duplicate embeddings in the retrieval pool.
+    Returns (expr_tokens, result_tokens).  All 32 families are included;
+    P (map-fn) and Q (filter-fn) now return real vector results.
 
-    Distribution (approx 50% simple / 50% complex, 29 families total):
-      Simple  A arithmetic   6%    Complex  R reduce-fn     3%
-              B let          3%             S nested-let    4%
-              C hof          4%             T triple-let    4%
-              D conditional  3%             U cond-form     3%
-              E multi-let    5%             L threading     5%
-              F hof-arith    3%             M when          3%
-              G let-cond     2%             N equality      3%
-              H deep-arith   2%             O not           4%
-              I product      5%             V let-hof       4%
-              J seq-let      4%             W let-cond-comp 3%
-              K hof-cross    2%             X depth4-arith  3%
-                                            Y let-thread    4%
-                                            Z thread-cond   4%
-                                           AA triple-nlet   4%
-                                           BB let-dual-hof  4%
-                                           CC vector-result 6%
+    Distribution (32 families total):
+      Simple  A arithmetic   5%    Complex  P map-fn        4%
+              B let          2%             Q filter-fn     3%
+              C hof          3%             R reduce-fn     3%
+              D conditional  2%             S nested-let    3%
+              E multi-let    4%             T triple-let    3%
+              F hof-arith    2%             U cond-form     3%
+              G let-cond     2%             V let-hof       3%
+              H deep-arith   2%             W let-cond-comp 3%
+              I product      4%             X depth4-arith  3%
+              J seq-let      3%             Y let-thread    3%
+              K hof-cross    2%             Z thread-cond   3%
+              L threading    4%            AA triple-nlet   3%
+              M when         3%            BB let-dual-hof  3%
+              N equality     3%            CC vector-result 4%
+              O not          3%            DD var-shadow    4%
+                                           EE seq-let3      4%
+                                           FF thread-last   4%
     """
     r = rng.random()
-    if r < 0.06:   return _gen_arithmetic(rng)
-    elif r < 0.09: return _gen_let(rng)
-    elif r < 0.13: return _gen_hof(rng)
-    elif r < 0.16: return _gen_conditional(rng)
-    elif r < 0.21: return _gen_multi_let(rng)
-    elif r < 0.24: return _gen_hof_arithmetic(rng)
-    elif r < 0.26: return _gen_let_cond(rng)
-    elif r < 0.28: return _gen_deep_arithmetic(rng)
-    elif r < 0.33: return _gen_product(rng)
-    elif r < 0.37: return _gen_seq_let(rng)
-    elif r < 0.39: return _gen_hof_cross(rng)
-    elif r < 0.42: return _gen_reduce_fn(rng)
-    elif r < 0.46: return _gen_nested_let(rng)
-    elif r < 0.50: return _gen_triple_let(rng)
-    elif r < 0.53: return _gen_cond_form(rng)
-    elif r < 0.58: return _gen_threading(rng)
-    elif r < 0.61: return _gen_when(rng)
-    elif r < 0.64: return _gen_equality(rng)
-    elif r < 0.68: return _gen_not(rng)
-    elif r < 0.72: return _gen_let_hof(rng)
-    elif r < 0.75: return _gen_let_cond_composed(rng)
-    elif r < 0.78: return _gen_depth4_arith(rng)
-    elif r < 0.82: return _gen_let_threading(rng)
-    elif r < 0.86: return _gen_threading_cond(rng)
-    elif r < 0.90: return _gen_triple_nested_let(rng)
-    elif r < 0.94: return _gen_let_dual_hof(rng)
-    else:          return _gen_vector_result(rng)
+    if r < 0.05:   return _gen_arithmetic(rng)
+    elif r < 0.07: return _gen_let(rng)
+    elif r < 0.10: return _gen_hof(rng)
+    elif r < 0.12: return _gen_conditional(rng)
+    elif r < 0.16: return _gen_multi_let(rng)
+    elif r < 0.18: return _gen_hof_arithmetic(rng)
+    elif r < 0.20: return _gen_let_cond(rng)
+    elif r < 0.22: return _gen_deep_arithmetic(rng)
+    elif r < 0.26: return _gen_product(rng)
+    elif r < 0.29: return _gen_seq_let(rng)
+    elif r < 0.31: return _gen_hof_cross(rng)
+    elif r < 0.35: return _gen_threading(rng)
+    elif r < 0.38: return _gen_when(rng)
+    elif r < 0.41: return _gen_equality(rng)
+    elif r < 0.44: return _gen_not(rng)
+    elif r < 0.48: return _gen_map_fn(rng)
+    elif r < 0.51: return _gen_filter_fn(rng)
+    elif r < 0.54: return _gen_reduce_fn(rng)
+    elif r < 0.57: return _gen_nested_let(rng)
+    elif r < 0.60: return _gen_triple_let(rng)
+    elif r < 0.63: return _gen_cond_form(rng)
+    elif r < 0.66: return _gen_let_hof(rng)
+    elif r < 0.69: return _gen_let_cond_composed(rng)
+    elif r < 0.72: return _gen_depth4_arith(rng)
+    elif r < 0.75: return _gen_let_threading(rng)
+    elif r < 0.78: return _gen_threading_cond(rng)
+    elif r < 0.81: return _gen_triple_nested_let(rng)
+    elif r < 0.84: return _gen_let_dual_hof(rng)
+    elif r < 0.88: return _gen_vector_result(rng)
+    elif r < 0.92: return _gen_var_shadow(rng)
+    elif r < 0.96: return _gen_seq_let3(rng)
+    else:          return _gen_thread_last(rng)
 
 
 def encode_pair(vocab, expr_toks, res_toks, max_expr=MAX_EXPR_LEN, max_res=MAX_RESULT_LEN):
