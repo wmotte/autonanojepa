@@ -36,19 +36,19 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # Hyperparameters (editable by autoresearch loop)
 # ---------------------------------------------------------------------------
 
-N_EMBD = 168
+N_EMBD = 128
 DEPTH = 4
-N_HEAD = 4            # 168 // 4 = 42 (even for RoPE)
-EMA_TAU_START = 0.996   # I-JEPA cosine schedule: fast early (bootstrap random init)
-EMA_TAU_END   = 0.9999  # slow late (stable target for fine-grained alignment)
+N_HEAD = 4
+EMA_TAU_START = 0.996
+EMA_TAU_END   = 0.9999
 VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 0.5
-VICREG_COV = 0.15       # Increased covariance regularization
-SUBEXPR_WEIGHT = 0.4    # Sub-expression auxiliary loss weight (Gap 2)
-INFONCE_WEIGHT = 0.5    # MoCo queue InfoNCE contrastive loss weight
-INFONCE_TEMP   = 0.07   # Lower temp now that we have 2048 negatives (MoCo v2 default)
-QUEUE_SIZE     = 2048   # MoCo momentum queue: number of stored target embeddings
-DEVICE_BATCH_SIZE = 26  # Adjusted for N_EMBD=168 to stay under 1GB
+VICREG_COV = 0.15
+SUBEXPR_WEIGHT = 0.4
+INFONCE_WEIGHT = 0.5
+INFONCE_TEMP   = 0.07
+QUEUE_SIZE     = 2048
+DEVICE_BATCH_SIZE = 32  # increased since N_EMBD is smaller
 MATRIX_LR = 0.0012
 EMBEDDING_LR = 0.012
 WEIGHT_DECAY = 0.01
@@ -252,11 +252,11 @@ class NanoJEPA(nn.Module):
     def __init__(self, vocab_size, n_embd, n_layer, n_head):
         super().__init__()
         self.ctx_encoder = ClojureEncoder(vocab_size, n_embd, n_layer, n_head)
-        # Forward predictor: expr → result
-        self.pred_fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
-        self.pred_fc2 = nn.Linear(4 * n_embd, 4 * n_embd, bias=False)
-        self.pred_fc3 = nn.Linear(4 * n_embd, n_embd, bias=False)
-        # Reverse predictor: result → expr (symmetric JEPA)
+        # Forward predictor: expr tokens → result embedding via learned query
+        self.res_query = mx.random.normal((1, 1, n_embd)) * 0.02
+        self.pred_blocks = [EncoderBlock(n_embd, n_head) for _ in range(2)]
+        
+        # Reverse predictor: result → expr (symmetric JEPA) - keep as MLP for now
         self.rev_pred_fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
         self.rev_pred_fc2 = nn.Linear(4 * n_embd, 4 * n_embd, bias=False)
         self.rev_pred_fc3 = nn.Linear(4 * n_embd, n_embd, bias=False)
@@ -264,11 +264,18 @@ class NanoJEPA(nn.Module):
         self.subexpr_fc1 = nn.Linear(n_embd, 2 * n_embd, bias=False)
         self.subexpr_fc2 = nn.Linear(2 * n_embd, n_embd, bias=False)
 
-    def predict(self, z):
-        h = norm(nn.gelu(self.pred_fc1(z)))
-        h = norm(nn.gelu(self.pred_fc2(h)))
-        z_pred = self.pred_fc3(h)
-        return z_pred
+    def predict(self, hidden_ctx):
+        B, T, D = hidden_ctx.shape
+        # Tile learned query for the batch
+        q = mx.broadcast_to(self.res_query, (B, 1, D))
+        # Concatenate query to the beginning of context hidden states
+        # Resulting shape: (B, 1 + T, D)
+        x = mx.concatenate([q, hidden_ctx], axis=1)
+        # Pass through predictor transformer layers
+        for block in self.pred_blocks:
+            x = block(x)
+        # z_pred is the state of the query token (index 0)
+        return norm(x[:, 0])
 
     def predict_reverse(self, z):
         """Reverse predictor: predict expression embedding from result embedding."""
@@ -282,8 +289,9 @@ class NanoJEPA(nn.Module):
         return self.subexpr_fc2(h)
 
     def __call__(self, expr_tokens, expr_mask, expr_vals):
-        z_ctx = self.ctx_encoder(expr_tokens, expr_mask, expr_vals)
-        z_pred = self.predict(z_ctx)
+        # Forward pass used during evaluation
+        z_ctx, hidden_ctx = self.ctx_encoder.encode_full(expr_tokens, expr_mask, expr_vals)
+        z_pred = self.predict(hidden_ctx)
         return z_pred
 
 
@@ -375,9 +383,9 @@ def compute_span_info(expr_np, expr_mask_np):
 def compute_loss(model, target_enc, expr_tokens, expr_mask, expr_vals,
                  res_tokens, res_mask, res_vals,
                  span_starts, span_mask, queue_keys):
-    # Gap 2: encode_full returns per-token hidden states needed for subexpr loss
+    # Gap 2: encode_full returns per-token hidden states needed for transformer predictor
     z_ctx, hidden_ctx = model.ctx_encoder.encode_full(expr_tokens, expr_mask, expr_vals)
-    z_pred = model.predict(z_ctx)
+    z_pred = model.predict(hidden_ctx)
     z_tgt = mx.stop_gradient(target_enc(res_tokens, res_mask, res_vals))
 
     # L2-normalize for cosine loss
