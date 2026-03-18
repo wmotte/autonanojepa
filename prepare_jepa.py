@@ -20,7 +20,7 @@ import numpy as np
 # Constants (fixed)
 # ---------------------------------------------------------------------------
 
-VOCAB_SIZE = 96
+VOCAB_SIZE = 56  # removed 41 discrete number tokens, added 1 NUM token
 MAX_EXPR_LEN = 40
 MAX_RESULT_LEN = 8
 TIME_BUDGET = 120
@@ -40,25 +40,27 @@ _HOF = ["map", "filter", "reduce", "count", "first", "last", "rest", "cons"]  # 
 _DICT = ["assoc", "get", "keys", "vals", "merge"]  # 28-32
 _FORMS = ["let", "fn", "if", "cond", "def"]  # 33-37
 _VARS = ["x", "y", "z", "a", "b", "n", "m"]  # 38-44
-# Numbers -10 to 30 as tokens: 41 tokens (45-85)
-_NUMBERS = [str(i) for i in range(-10, 31)]  # 41 tokens
-# Booleans and nil (86-89)
-_BOOLEANS = ["true", "false", "nil", "pos?"]  # 86-89 (pos? needed for conditionals)
-# Extra Clojure tokens (90-95) — replaces reserved padding
-_EXTRA = ["MASK", "->", "->>", "when", "not", "="]  # 90-95
+# Booleans and nil (45-48)
+_BOOLEANS = ["true", "false", "nil", "pos?"]  # 45-48 (pos? needed for conditionals)
+# Extra Clojure tokens (49-54)
+_EXTRA = ["MASK", "->", "->>", "when", "not", "="]  # 49-54
+# Numeric placeholder: replaces all discrete number tokens (55)
+# Actual integer value is carried in a parallel vals array and encoded via sinusoidal embedding.
+_NUM = ["NUM"]  # 55
 
-_ALL_TOKENS = _SPECIAL + _SYNTAX + _OPERATORS + _HOF + _DICT + _FORMS + _VARS + _NUMBERS + _BOOLEANS + _EXTRA
+_ALL_TOKENS = _SPECIAL + _SYNTAX + _OPERATORS + _HOF + _DICT + _FORMS + _VARS + _BOOLEANS + _EXTRA + _NUM
 
 assert len(_ALL_TOKENS) == VOCAB_SIZE, f"Expected {VOCAB_SIZE} tokens, got {len(_ALL_TOKENS)}"
 
 _TOKEN_TO_ID = {tok: i for i, tok in enumerate(_ALL_TOKENS)}
 _ID_TO_TOKEN = {i: tok for i, tok in enumerate(_ALL_TOKENS)}
 
-PAD_ID = _TOKEN_TO_ID["PAD"]
-BOS_ID = _TOKEN_TO_ID["BOS"]
-SEP_ID = _TOKEN_TO_ID["SEP"]
-EOS_ID = _TOKEN_TO_ID["EOS"]
+PAD_ID  = _TOKEN_TO_ID["PAD"]
+BOS_ID  = _TOKEN_TO_ID["BOS"]
+SEP_ID  = _TOKEN_TO_ID["SEP"]
+EOS_ID  = _TOKEN_TO_ID["EOS"]
 MASK_ID = _TOKEN_TO_ID["MASK"]
+NUM_ID  = _TOKEN_TO_ID["NUM"]
 MASK_STR = "MASK"
 
 
@@ -90,9 +92,8 @@ class ClojureVocab:
 # ---------------------------------------------------------------------------
 
 def _num_tok(n):
-    """Return string token for integer n (clipped to vocab range -10..30)."""
-    n = max(-10, min(30, int(round(n))))
-    return str(n)
+    """Return string token for integer n — no clipping, any integer is valid."""
+    return str(int(round(n)))
 
 
 def _safe_div(a, b):
@@ -1220,24 +1221,48 @@ def generate_pair(rng):
     else:          return _gen_thread_last(rng)
 
 
+def _parse_int(t):
+    """Return (True, int_val) if t is a parseable integer string, else (False, 0)."""
+    try:
+        return True, int(t)
+    except (ValueError, TypeError):
+        return False, 0
+
+
 def encode_pair(vocab, expr_toks, res_toks, max_expr=MAX_EXPR_LEN, max_res=MAX_RESULT_LEN):
-    """Encode token lists to padded integer arrays."""
-    expr_ids = [BOS_ID] + vocab.encode(expr_toks)
-    expr_ids = expr_ids[:max_expr]
-    expr_mask = [1] * len(expr_ids) + [0] * (max_expr - len(expr_ids))
-    expr_ids = expr_ids + [PAD_ID] * (max_expr - len(expr_ids))
+    """Encode token lists to padded integer arrays + numeric value arrays.
 
-    res_ids = [BOS_ID] + vocab.encode(res_toks)
-    res_ids = res_ids[:max_res]
-    res_mask = [1] * len(res_ids) + [0] * (max_res - len(res_ids))
-    res_ids = res_ids + [PAD_ID] * (max_res - len(res_ids))
+    Numbers are encoded as NUM_ID in the token array; their actual integer
+    values are stored in parallel vals arrays for the sinusoidal embedding.
 
-    return (
-        np.array(expr_ids, dtype=np.int32),
-        np.array(expr_mask, dtype=np.int32),
-        np.array(res_ids, dtype=np.int32),
-        np.array(res_mask, dtype=np.int32),
-    )
+    Returns (expr_ids, expr_mask, expr_vals, res_ids, res_mask, res_vals).
+    """
+    def _encode(toks, max_len):
+        ids  = [BOS_ID]
+        vals = [0]
+        for t in toks:
+            is_int, iv = _parse_int(t)
+            if is_int:
+                ids.append(NUM_ID)
+                vals.append(iv)
+            elif t in vocab.token_to_id:
+                ids.append(vocab.token_to_id[t])
+                vals.append(0)
+        ids  = ids[:max_len]
+        vals = vals[:max_len]
+        n    = len(ids)
+        mask = [1] * n + [0] * (max_len - n)
+        ids  = ids  + [PAD_ID] * (max_len - n)
+        vals = vals + [0]      * (max_len - n)
+        return (
+            np.array(ids,  dtype=np.int32),
+            np.array(mask, dtype=np.int32),
+            np.array(vals, dtype=np.int32),
+        )
+
+    ei, em, ev = _encode(expr_toks, max_expr)
+    ri, rm, rv = _encode(res_toks,  max_res)
+    return ei, em, ev, ri, rm, rv
 
 
 # ---------------------------------------------------------------------------
@@ -1246,56 +1271,53 @@ def encode_pair(vocab, expr_toks, res_toks, max_expr=MAX_EXPR_LEN, max_res=MAX_R
 
 def load_val_pairs():
     """Load cached 2000 validation pairs. Generates and caches on first call.
-    Returns (expr, expr_mask, res, res_mask, mask_len).
-    mask_len is the number of tokens masked per pair (1/2/3).
+    Returns (expr, expr_mask, expr_vals, res, res_mask, res_vals, mask_len).
+    mask_len is the expression complexity bucket (1/2/3).
 
-    Format: plain text, 2000 rows x 81 columns (int32).
-    Columns: expr[32] | expr_mask[32] | res[8] | res_mask[8] | mask_len[1]
+    Format: plain text, 2000 rows x 145 columns (int32).
+    Columns: expr[40] | expr_mask[40] | expr_vals[40] | res[8] | res_mask[8] | res_vals[8] | mask_len[1]
     """
     if not os.path.exists(VAL_CACHE_PATH):
         _generate_val_cache()
     data = np.loadtxt(VAL_CACHE_PATH, dtype=np.int32)
-    expr      = data[:, :MAX_EXPR_LEN]
-    expr_mask = data[:, MAX_EXPR_LEN:2 * MAX_EXPR_LEN]
-    res       = data[:, 2 * MAX_EXPR_LEN:2 * MAX_EXPR_LEN + MAX_RESULT_LEN]
-    res_mask  = data[:, 2 * MAX_EXPR_LEN + MAX_RESULT_LEN:2 * MAX_EXPR_LEN + 2 * MAX_RESULT_LEN]
+    E = MAX_EXPR_LEN
+    R = MAX_RESULT_LEN
+    expr      = data[:, :E]
+    expr_mask = data[:, E:2*E]
+    expr_vals = data[:, 2*E:3*E]
+    res       = data[:, 3*E:3*E+R]
+    res_mask  = data[:, 3*E+R:3*E+2*R]
+    res_vals  = data[:, 3*E+2*R:3*E+3*R]
     mask_len  = data[:, -1]
-    return expr, expr_mask, res, res_mask, mask_len
-
-
-# Val cache filter: allow only even integers as results (min gap = 2 between any
-# two integer results, preventing adjacent-number confusion in retrieval).
-# e.g. (+ 2 3)→5 and (+ 2 4)→6 cannot both appear; only even results like 4 and 6.
-# Non-integer results (true, false, nil) are always allowed.
-_VAL_INT_RESULTS_ALLOWED = frozenset(range(-10, 31, 2))  # {-10, -8, ..., 30}
+    return expr, expr_mask, expr_vals, res, res_mask, res_vals, mask_len
 
 
 def _generate_val_cache():
     os.makedirs(CACHE_DIR, exist_ok=True)
     rng = random.Random(12345)
     vocab = ClojureVocab()
-    exprs, expr_masks, ress, res_masks, mask_lens = [], [], [], [], []
+    exprs, expr_masks, expr_vals_list = [], [], []
+    ress,  res_masks,  res_vals_list  = [], [], []
+    mask_lens = []
     while len(exprs) < N_VAL_PAIRS:
         expr_toks, result_toks = generate_pair(rng)
-        # Reject odd-integer results to prevent adjacent-number confusion
-        try:
-            if int(result_toks[0]) not in _VAL_INT_RESULTS_ALLOWED:
-                continue
-        except (ValueError, IndexError):
-            pass  # non-numeric result (true, false, nil): always allowed
-        e, em, r, rm = encode_pair(vocab, expr_toks, result_toks)
+        e, em, ev, r, rm, rv = encode_pair(vocab, expr_toks, result_toks)
         exprs.append(e)
         expr_masks.append(em)
+        expr_vals_list.append(ev)
         ress.append(r)
         res_masks.append(rm)
+        res_vals_list.append(rv)
         # Expression complexity bucket: 1=short(≤7), 2=medium(≤14), 3=long(>14)
         n = len(expr_toks)
         mask_lens.append(1 if n <= 7 else 2 if n <= 14 else 3)
     data = np.concatenate([
         np.stack(exprs),
         np.stack(expr_masks),
+        np.stack(expr_vals_list),
         np.stack(ress),
         np.stack(res_masks),
+        np.stack(res_vals_list),
         np.array(mask_lens, dtype=np.int32)[:, None],
     ], axis=1)
     np.savetxt(VAL_CACHE_PATH, data, fmt="%d")
@@ -1307,22 +1329,27 @@ def _generate_val_cache():
 # ---------------------------------------------------------------------------
 
 def make_jepa_dataloader(vocab, batch_size):
-    """Infinite generator of (expr, expr_mask, res, res_mask) batches."""
+    """Infinite generator of (expr, expr_mask, expr_vals, res, res_mask, res_vals) batches."""
     rng = random.Random()
     while True:
-        exprs, expr_masks, ress, res_masks = [], [], [], []
+        exprs, expr_masks, expr_vals_list = [], [], []
+        ress,  res_masks,  res_vals_list  = [], [], []
         for _ in range(batch_size):
             et, rt = generate_pair(rng)
-            e, em, r, rm = encode_pair(vocab, et, rt)
+            e, em, ev, r, rm, rv = encode_pair(vocab, et, rt)
             exprs.append(e)
             expr_masks.append(em)
+            expr_vals_list.append(ev)
             ress.append(r)
             res_masks.append(rm)
+            res_vals_list.append(rv)
         yield (
             np.stack(exprs),
             np.stack(expr_masks),
+            np.stack(expr_vals_list),
             np.stack(ress),
             np.stack(res_masks),
+            np.stack(res_vals_list),
         )
 
 

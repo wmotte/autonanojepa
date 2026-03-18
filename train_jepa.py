@@ -22,6 +22,7 @@ from prepare_jepa import (
     MAX_RESULT_LEN,
     VOCAB_SIZE,
     BOS_ID,
+    NUM_ID,
     ClojureVocab,
     load_val_pairs,
     make_jepa_dataloader,
@@ -98,6 +99,45 @@ class DepthEmbedding(nn.Module):
         depth = mx.maximum(cum - delta, 0)
         depth = mx.minimum(depth, self.max_depth)
         return self.emb(depth)
+
+
+# ---------------------------------------------------------------------------
+# Numeric value embedding (sinusoidal — replaces discrete number tokens)
+# ---------------------------------------------------------------------------
+
+
+class NumericValueEmbedding(nn.Module):
+    """Sinusoidal embedding for integer values carried by NUM tokens.
+
+    For positions where tok == NUM_ID, computes a sinusoidal encoding of the
+    actual integer value and projects it to n_embd dimensions.
+    Non-NUM positions contribute zero, leaving those positions' embeddings
+    determined solely by wte + depth_emb.
+    """
+
+    def __init__(self, n_embd):
+        super().__init__()
+        self.n_embd = n_embd
+        self.proj = nn.Linear(n_embd, n_embd, bias=False)
+
+    def __call__(self, tokens, vals):
+        # tokens: (B, T) int32 — token IDs
+        # vals:   (B, T) int32 — integer value for NUM positions, 0 elsewhere
+        half = self.n_embd // 2
+        v = vals.astype(mx.float32)  # (B, T)
+
+        # Standard transformer sinusoidal frequencies
+        freqs = mx.exp(
+            -mx.arange(half, dtype=mx.float32) * (math.log(10000.0) / max(half - 1, 1))
+        )  # (half,)
+
+        angles = v[..., None] * freqs[None, None, :]          # (B, T, half)
+        enc = mx.concatenate([mx.sin(angles), mx.cos(angles)], axis=-1)  # (B, T, n_embd)
+        enc = self.proj(enc)
+
+        # Zero out non-NUM positions
+        is_num = (tokens == NUM_ID).astype(mx.float32)[..., None]  # (B, T, 1)
+        return enc * is_num
 
 
 # ---------------------------------------------------------------------------
@@ -180,27 +220,28 @@ class ClojureEncoder(nn.Module):
         super().__init__()
         self.wte = nn.Embedding(vocab_size, n_embd)
         self.depth_emb = DepthEmbedding(MAX_DEPTH, n_embd)  # Gap 1
+        self.num_val_emb = NumericValueEmbedding(n_embd)    # sinusoidal integer values
         self.blocks = [EncoderBlock(n_embd, n_head) for _ in range(n_layer)]
         self.pool = AttentionPool(n_embd)
 
-    def _run_transformer(self, tokens):
+    def _run_transformer(self, tokens, vals):
         """Full transformer pass; returns per-token hidden states (B, T, D)."""
-        x = self.wte(tokens) + self.depth_emb(tokens)  # Gap 1: depth signal
+        x = self.wte(tokens) + self.depth_emb(tokens) + self.num_val_emb(tokens, vals)
         x = norm(x)
         for block in self.blocks:
             x = block(x)
         return norm(x)
 
-    def __call__(self, tokens, mask):
-        # tokens: (B, T), mask: (B, T) float 0/1
-        x = self._run_transformer(tokens)
+    def __call__(self, tokens, mask, vals):
+        # tokens: (B, T), mask: (B, T) float 0/1, vals: (B, T) int32
+        x = self._run_transformer(tokens, vals)
         return self.pool(x, mask.astype(mx.float32))
 
-    def encode_full(self, tokens, mask):
+    def encode_full(self, tokens, mask, vals):
         """Returns (z, hidden): pooled embedding + per-token hidden states (B, T, D).
         Used by sub-expression auxiliary loss (Gap 2).
         """
-        x = self._run_transformer(tokens)
+        x = self._run_transformer(tokens, vals)
         z = self.pool(x, mask.astype(mx.float32))
         return z, x
 
@@ -240,8 +281,8 @@ class NanoJEPA(nn.Module):
         h = norm(mx.maximum(self.subexpr_fc1(z_span_root), 0))
         return self.subexpr_fc2(h)
 
-    def __call__(self, expr_tokens, expr_mask):
-        z_ctx = self.ctx_encoder(expr_tokens, expr_mask)
+    def __call__(self, expr_tokens, expr_mask, expr_vals):
+        z_ctx = self.ctx_encoder(expr_tokens, expr_mask, expr_vals)
         z_pred = self.predict(z_ctx)
         return z_pred
 
@@ -331,12 +372,13 @@ def compute_span_info(expr_np, expr_mask_np):
 # ---------------------------------------------------------------------------
 
 
-def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask,
+def compute_loss(model, target_enc, expr_tokens, expr_mask, expr_vals,
+                 res_tokens, res_mask, res_vals,
                  span_starts, span_mask, queue_keys):
     # Gap 2: encode_full returns per-token hidden states needed for subexpr loss
-    z_ctx, hidden_ctx = model.ctx_encoder.encode_full(expr_tokens, expr_mask)
+    z_ctx, hidden_ctx = model.ctx_encoder.encode_full(expr_tokens, expr_mask, expr_vals)
     z_pred = model.predict(z_ctx)
-    z_tgt = mx.stop_gradient(target_enc(res_tokens, res_mask))
+    z_tgt = mx.stop_gradient(target_enc(res_tokens, res_mask, res_vals))
 
     # L2-normalize for cosine loss
     z_pred_n = z_pred * mx.rsqrt(mx.sum(z_pred * z_pred, axis=-1, keepdims=True) + 1e-8)
@@ -375,7 +417,7 @@ def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask
     # Prediction: from the hidden state at the span's opening bracket.
     # This forces each ( hidden state to encode what its sub-expression means.
     B = expr_tokens.shape[0]
-    z_span_tgt = mx.stop_gradient(target_enc(expr_tokens, span_mask))
+    z_span_tgt = mx.stop_gradient(target_enc(expr_tokens, span_mask, expr_vals))
     clamped_starts = mx.maximum(span_starts, 0)          # clamp -1 → 0 (masked out below)
     z_span_root = hidden_ctx[mx.arange(B), clamped_starts]  # (B, D)
     z_span_pred = model.predict_subexpr(z_span_root)
@@ -521,7 +563,7 @@ def _val_span_info(expr_np, expr_mask_np):
     return span_starts, span_masks
 
 
-def _evaluate_subexpr_cos(model, target_enc, expr, expr_mask, batch_size=256):
+def _evaluate_subexpr_cos(model, target_enc, expr, expr_mask, expr_vals, batch_size=256):
     """Cosine similarity for sub-expression prediction head (Gap 2).
 
     For each val item with a valid interior span, tests whether
@@ -535,13 +577,14 @@ def _evaluate_subexpr_cos(model, target_enc, expr, expr_mask, batch_size=256):
 
     for start in range(0, N, batch_size):
         end = min(start + batch_size, N)
-        e   = mx.array(expr[start:end],         dtype=mx.int32)
-        em  = mx.array(expr_mask[start:end],    dtype=mx.float32)
+        e   = mx.array(expr[start:end],           dtype=mx.int32)
+        em  = mx.array(expr_mask[start:end],      dtype=mx.float32)
+        ev  = mx.array(expr_vals[start:end],      dtype=mx.int32)
         ss  = mx.array(span_starts_np[start:end], dtype=mx.int32)
         smk = mx.array(span_masks_np[start:end],  dtype=mx.float32)
 
-        _, hidden   = model.ctx_encoder.encode_full(e, em)
-        z_span_tgt  = mx.stop_gradient(target_enc(e, smk))
+        _, hidden   = model.ctx_encoder.encode_full(e, em, ev)
+        z_span_tgt  = mx.stop_gradient(target_enc(e, smk, ev))
         clamped     = mx.maximum(ss, 0)
         B           = e.shape[0]
         z_span_root = hidden[mx.arange(B), clamped]         # (B, D)
@@ -566,74 +609,74 @@ def _evaluate_subexpr_cos(model, target_enc, expr, expr_mask, batch_size=256):
 
 
 def evaluate_val_retrieval(model, target_enc, batch_size=256):
-    """Evaluate on 2000 masked-JEPA val pairs.
+    """Evaluate on 2000 val pairs.
 
-    Returns (val_mean_cos, val_class_acc, cos_by_masklen, val_subexpr_cos):
-      - val_mean_cos:    mean cosine similarity (all pairs)
-      - val_class_acc:   nearest-neighbour token accuracy on mask_len==1 pairs
-      - cos_by_masklen:  {1: float, 2: float, 3: float} cosine by mask length
+    Returns (val_mean_cos, recall_at_1, cos_by_masklen, val_subexpr_cos):
+      - val_mean_cos:    mean cosine similarity between predicted and true target
+      - recall_at_1:     fraction of predictions whose correct target is the
+                         nearest neighbour among all 2000 target embeddings
+      - cos_by_masklen:  {1: float, 2: float, 3: float} cosine by complexity bucket
       - val_subexpr_cos: cosine for sub-expression prediction head (Gap 2)
     """
-    expr, expr_mask, res, res_mask, mask_len = load_val_pairs()
+    expr, expr_mask, expr_vals, res, res_mask, res_vals, mask_len = load_val_pairs()
     N = len(expr)
-    cos_sims = []
+    cos_sims   = []
     all_z_pred = []
+    all_z_tgt  = []
 
     for start in range(0, N, batch_size):
         end = min(start + batch_size, N)
-        e = mx.array(expr[start:end], dtype=mx.int32)
+        e  = mx.array(expr[start:end],      dtype=mx.int32)
         em = mx.array(expr_mask[start:end], dtype=mx.float32)
-        r = mx.array(res[start:end], dtype=mx.int32)
-        rm = mx.array(res_mask[start:end], dtype=mx.float32)
+        ev = mx.array(expr_vals[start:end], dtype=mx.int32)
+        r  = mx.array(res[start:end],       dtype=mx.int32)
+        rm = mx.array(res_mask[start:end],  dtype=mx.float32)
+        rv = mx.array(res_vals[start:end],  dtype=mx.int32)
 
-        z_pred = model(e, em)
-        z_tgt = mx.stop_gradient(target_enc(r, rm))
+        z_pred = model(e, em, ev)
+        z_tgt  = mx.stop_gradient(target_enc(r, rm, rv))
 
         z_pred_n = z_pred * mx.rsqrt(mx.sum(z_pred * z_pred, axis=-1, keepdims=True) + 1e-8)
-        z_tgt_n = z_tgt * mx.rsqrt(mx.sum(z_tgt * z_tgt, axis=-1, keepdims=True) + 1e-8)
+        z_tgt_n  = z_tgt  * mx.rsqrt(mx.sum(z_tgt  * z_tgt,  axis=-1, keepdims=True) + 1e-8)
 
         cos_sim = mx.sum(z_pred_n * z_tgt_n, axis=-1)  # (batch,)
-        mx.eval(cos_sim, z_pred_n)
+        mx.eval(cos_sim, z_pred_n, z_tgt_n)
         cos_sims.append(cos_sim)
-        all_z_pred.append(z_pred_n)
+        all_z_pred.append(np.array(z_pred_n))
+        all_z_tgt.append(np.array(z_tgt_n))
 
     cos_all = mx.concatenate(cos_sims, axis=0)  # (N,)
     mx.eval(cos_all)
     cos_np   = np.array(cos_all)
     mean_cos = float(np.mean(cos_np))
 
-    # --- Cosine breakdown by mask length (1 / 2 / 3 tokens masked) ---
+    # --- Cosine breakdown by complexity bucket ---
     cos_by_masklen = {}
     for ml in [1, 2, 3]:
         idx = np.where(mask_len == ml)[0]
         cos_by_masklen[ml] = float(np.mean(cos_np[idx])) if len(idx) > 0 else 0.0
 
-    # --- Class accuracy on single-token mask pairs ---
-    # Build one prototype embedding per vocab token: target_enc([BOS, tok, PAD...], [1,1,0...])
-    proto_tok = np.zeros((VOCAB_SIZE, MAX_RESULT_LEN), dtype=np.int32)
-    proto_msk = np.zeros((VOCAB_SIZE, MAX_RESULT_LEN), dtype=np.float32)
-    proto_tok[:, 0] = BOS_ID
-    proto_tok[np.arange(VOCAB_SIZE), 1] = np.arange(VOCAB_SIZE)
-    proto_msk[:, 0] = 1.0
-    proto_msk[:, 1] = 1.0
-    z_proto = mx.stop_gradient(target_enc(mx.array(proto_tok), mx.array(proto_msk)))
-    z_proto_n = z_proto * mx.rsqrt(mx.sum(z_proto * z_proto, axis=-1, keepdims=True) + 1e-8)
-    mx.eval(z_proto_n)
-
-    single_idx = np.where(mask_len == 1)[0]
-    class_acc = 0.0
-    if len(single_idx) > 0:
-        z_pred_all = mx.concatenate(all_z_pred, axis=0)             # (N, D)
-        z_single   = z_pred_all[mx.array(single_idx, dtype=mx.int32)]  # (M, D)
-        sims       = mx.matmul(z_single, mx.transpose(z_proto_n))   # (M, 96)
-        pred_toks  = mx.argmax(sims, axis=1)                        # (M,)
-        true_toks  = mx.array(res[single_idx, 1], dtype=mx.int32)   # token after BOS
-        class_acc  = float(mx.mean((pred_toks == true_toks).astype(mx.float32)).item())
+    # --- Recall@1: nearest-neighbour retrieval across all 2000 targets ---
+    # For each predicted embedding, the retrieved result is the nearest among all
+    # N target embeddings.  "Correct" means the retrieved target has the same
+    # embedding as the true target (handles duplicate results such as many
+    # expressions all evaluating to `true`, `false`, or the same integer).
+    Z_pred    = np.concatenate(all_z_pred, axis=0)  # (N, D)
+    Z_tgt     = np.concatenate(all_z_tgt,  axis=0)  # (N, D)
+    sims      = Z_pred @ Z_tgt.T                    # (N, N)
+    retrieved = np.argmax(sims, axis=1)              # (N,)
+    # cos(true_target, retrieved_target) ≈ 1.0 iff they encode the same value
+    true_emb      = Z_tgt[np.arange(N)]             # (N, D)
+    retrieved_emb = Z_tgt[retrieved]                 # (N, D)
+    cos_match     = np.sum(true_emb * retrieved_emb, axis=1)  # (N,) — already L2-normalised
+    recall_at_1   = float(np.mean(cos_match > 0.9999))
 
     # --- Sub-expression prediction (Gap 2) ---
-    val_subexpr_cos = _evaluate_subexpr_cos(model, target_enc, expr, expr_mask, batch_size)
+    val_subexpr_cos = _evaluate_subexpr_cos(
+        model, target_enc, expr, expr_mask, expr_vals, batch_size
+    )
 
-    return mean_cos, class_acc, cos_by_masklen, val_subexpr_cos
+    return mean_cos, recall_at_1, cos_by_masklen, val_subexpr_cos
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +711,9 @@ optimizer = AdamW(model, matrix_lr=MATRIX_LR, embedding_lr=EMBEDDING_LR, weight_
 
 loss_grad_fn = nn.value_and_grad(
     model,
-    lambda m, et, em, rt, rm, ss, smk, qk: compute_loss(m, target_enc, et, em, rt, rm, ss, smk, qk),
+    lambda m, et, em, ev, rt, rm, rv, ss, smk, qk: compute_loss(
+        m, target_enc, et, em, ev, rt, rm, rv, ss, smk, qk
+    ),
 )
 
 # MoCo queue: circular buffer of L2-normalised target embeddings (numpy, not MLX)
@@ -687,19 +732,24 @@ total_pairs = 0
 while True:
     t0 = time.time()
 
-    expr_np, expr_mask_np, res_np, res_mask_np = next(train_loader)
+    expr_np, expr_mask_np, expr_vals_np, res_np, res_mask_np, res_vals_np = next(train_loader)
     # Gap 2: bracket matching on CPU before sending to GPU
     span_starts_np, span_mask_np = compute_span_info(expr_np, expr_mask_np)
 
-    expr_t = mx.array(expr_np, dtype=mx.int32)
-    expr_m = mx.array(expr_mask_np, dtype=mx.float32)
-    res_t  = mx.array(res_np, dtype=mx.int32)
-    res_m  = mx.array(res_mask_np, dtype=mx.float32)
+    expr_t      = mx.array(expr_np,      dtype=mx.int32)
+    expr_m      = mx.array(expr_mask_np, dtype=mx.float32)
+    expr_vals_t = mx.array(expr_vals_np, dtype=mx.int32)
+    res_t       = mx.array(res_np,       dtype=mx.int32)
+    res_m       = mx.array(res_mask_np,  dtype=mx.float32)
+    res_vals_t  = mx.array(res_vals_np,  dtype=mx.int32)
     span_starts_t = mx.array(span_starts_np, dtype=mx.int32)
     span_mask_t   = mx.array(span_mask_np,   dtype=mx.float32)
 
     queue_snapshot = mx.array(_queue_np, dtype=mx.float32)
-    loss, grads = loss_grad_fn(model, expr_t, expr_m, res_t, res_m, span_starts_t, span_mask_t, queue_snapshot)
+    loss, grads = loss_grad_fn(
+        model, expr_t, expr_m, expr_vals_t, res_t, res_m, res_vals_t,
+        span_starts_t, span_mask_t, queue_snapshot
+    )
     mx.eval(loss, grads)
 
     if t_compiled is None:
@@ -732,7 +782,7 @@ while True:
     mx.eval(target_enc.parameters())
 
     # Update MoCo queue with current batch's target embeddings
-    z_new = mx.stop_gradient(target_enc(res_t, res_m))
+    z_new = mx.stop_gradient(target_enc(res_t, res_m, res_vals_t))
     z_new_n = z_new * mx.rsqrt(mx.sum(z_new * z_new, axis=-1, keepdims=True) + 1e-8)
     mx.eval(z_new_n)
     new_keys = np.array(z_new_n)
