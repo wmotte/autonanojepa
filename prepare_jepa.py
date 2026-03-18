@@ -822,13 +822,26 @@ def load_val_pairs():
     return expr, expr_mask, res, res_mask, mask_len
 
 
+# Val cache filter: allow only even integers as results (min gap = 2 between any
+# two integer results, preventing adjacent-number confusion in retrieval).
+# e.g. (+ 2 3)→5 and (+ 2 4)→6 cannot both appear; only even results like 4 and 6.
+# Non-integer results (true, false, nil) are always allowed.
+_VAL_INT_RESULTS_ALLOWED = frozenset(range(-10, 31, 2))  # {-10, -8, ..., 30}
+
+
 def _generate_val_cache():
     os.makedirs(CACHE_DIR, exist_ok=True)
     rng = random.Random(12345)
     vocab = ClojureVocab()
     exprs, expr_masks, ress, res_masks, mask_lens = [], [], [], [], []
-    for _ in range(N_VAL_PAIRS):
+    while len(exprs) < N_VAL_PAIRS:
         expr_toks, result_toks = generate_pair(rng)
+        # Reject odd-integer results to prevent adjacent-number confusion
+        try:
+            if int(result_toks[0]) not in _VAL_INT_RESULTS_ALLOWED:
+                continue
+        except (ValueError, IndexError):
+            pass  # non-numeric result (true, false, nil): always allowed
         e, em, r, rm = encode_pair(vocab, expr_toks, result_toks)
         exprs.append(e)
         expr_masks.append(em)
