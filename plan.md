@@ -1,14 +1,15 @@
-# Plan: Pure Cross-Attention Predictor
+# Plan: Hard Negative Mining in MoCo
 
 ## 1. Idea
-Refine the Query-based Transformer Predictor to use **Pure Cross-Attention**. Currently, the predictor prepends a `[RESULT_QUERY]` to the `hidden_ctx` and runs full bidirectional self-attention over the combined sequence. This causes the context tokens to attend to each other again (redundant) and to the query token (potentially harmful). I will replace this with layers where only the `[RESULT_QUERY]` attends to the `hidden_ctx` via cross-attention. The context tokens will remain fixed throughout the predictor layers.
+Improve the MoCo-style InfoNCE contrastive loss by implementing **Hard Negative Mining**. Currently, the `infonce_loss` treats all 2048 embeddings in the queue as negatives with equal importance. I will modify the loss to select the Top-512 most similar negatives (hard negatives) from the queue for each batch item. This forces the model to focus its gradients on distinguishing between the most confusingly similar expressions in latent space.
 
 ## 2. Not low-hanging fruit — justify this
-This is a structural refinement of the attention mechanism. It moves from a "global workspace" model (where all tokens interact) to a "query-retrieval" model. Mechanistically, this ensures that the `hidden_ctx` acts as a static "key-value" memory that the predictor can probe multiple times without altering the memory itself. It focuses the predictor's capacity entirely on the query's transformation, which should lead to more efficient and better-grounded predictions. It also significantly reduces the computational complexity of the predictor from $O((1+T)^2)$ to $O(T)$ per layer.
+This is a sophisticated refinement of the contrastive objective. It moves from a "passive" contrastive loss to an "active" one that dynamically adapts to the model's current failures. Mechanistically, hard negative mining increases the signal-to-noise ratio of the gradients by ignoring easy negatives that have already been well-separated. This is particularly relevant for Clojure code, where many expressions may have similar syntactic structures but different execution results (e.g., changing a `+` to a `-`).
 
 ## 3. Evidence / references
-- **Perceiver IO (Jaegle et al., 2021)**: Successfully uses cross-attention to map large inputs to latents and back to outputs, proving that self-attention on the input is not always necessary if a powerful encoder is used.
-- **Standard Transformer Decoders**: The cross-attention layers are what allow the decoder to focus on specific encoder outputs; our predictor is essentially a 1-token decoder.
-- **Stable Diffusion / ControlNet**: Use cross-attention to inject conditioning information (context) into a latent process (query).
+- **Contrastive Learning with Hard Negative Samples (Robinson et al., 2020)**: Shows that focusing on hard negatives can significantly improve representation quality.
+- **FaceNet (Schroff et al., 2015)**: Famously used triplet loss with hard negative mining to achieve state-of-the-art face recognition.
+- **DINO / DINOv2**: Use various forms of local-to-global matching and negative management to improve discriminative power.
+- **Metric Learning**: Hard negative mining is a staple in training retrieval-based models where Recall@K is the primary metric.
 
-I will use 3 layers of Cross-Attention + MLP for the predictor to utilize the saved computation.
+I will use `mx.topk` to select the Top-512 negatives from the MoCo queue for each element in the batch.
