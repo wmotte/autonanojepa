@@ -3,3 +3,4 @@ commit	val_recall_at_1	memory_gb	status	description
 e994d63	87.6214	1.0	keep	attention pooling (learned D→1 query replaces mean pool)
 f332c8d	89.3204	1.0	keep	EMA tau cosine schedule (0.996→0.9999, I-JEPA style)
 028dc42	90.7767	1.0	keep	in-batch InfoNCE contrastive loss (T=0.1, weight=0.5)
+0a22e27	91.2621	1.0	keep	MoCo momentum queue InfoNCE (2048 negatives, T=0.07)

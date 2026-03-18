@@ -44,8 +44,9 @@ VICREG_LAMBDA = 1.0
 VICREG_GAMMA = 0.5
 VICREG_COV = 0.15       # Increased covariance regularization
 SUBEXPR_WEIGHT = 0.4    # Sub-expression auxiliary loss weight (Gap 2)
-INFONCE_WEIGHT = 0.5    # In-batch InfoNCE contrastive loss weight
-INFONCE_TEMP   = 0.1    # Temperature (0.1 > 0.07 for stability at small batch=26)
+INFONCE_WEIGHT = 0.5    # MoCo queue InfoNCE contrastive loss weight
+INFONCE_TEMP   = 0.07   # Lower temp now that we have 2048 negatives (MoCo v2 default)
+QUEUE_SIZE     = 2048   # MoCo momentum queue: number of stored target embeddings
 DEVICE_BATCH_SIZE = 26  # Adjusted for N_EMBD=168 to stay under 1GB
 MATRIX_LR = 0.0012
 EMBEDDING_LR = 0.012
@@ -331,7 +332,7 @@ def compute_span_info(expr_np, expr_mask_np):
 
 
 def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask,
-                 span_starts, span_mask):
+                 span_starts, span_mask, queue_keys):
     # Gap 2: encode_full returns per-token hidden states needed for subexpr loss
     z_ctx, hidden_ctx = model.ctx_encoder.encode_full(expr_tokens, expr_mask)
     z_pred = model.predict(z_ctx)
@@ -386,9 +387,13 @@ def compute_loss(model, target_enc, expr_tokens, expr_mask, res_tokens, res_mask
     n_valid   = mx.maximum(mx.sum(has_span), 1.0)
     subexpr_loss = mx.sum((1.0 - span_cos) * has_span) / n_valid
 
-    # In-batch InfoNCE: z_pred[i] vs z_tgt[j] for all j (positive = i==j)
-    logits = mx.matmul(z_pred_n, mx.transpose(z_tgt_n)) / INFONCE_TEMP  # (B, B)
-    labels = mx.arange(logits.shape[0], dtype=mx.int32)
+    # MoCo-style InfoNCE: z_pred[i] vs [queue | z_tgt_batch]
+    # Positives are at positions QUEUE_SIZE+i; queue entries are all negatives.
+    queue_sg = mx.stop_gradient(queue_keys)                              # (Q, D)
+    all_keys = mx.concatenate([queue_sg, z_tgt_n], axis=0)              # (Q+B, D)
+    B_size = expr_tokens.shape[0]
+    logits = mx.matmul(z_pred_n, mx.transpose(all_keys)) / INFONCE_TEMP # (B, Q+B)
+    labels = mx.arange(QUEUE_SIZE, QUEUE_SIZE + B_size, dtype=mx.int32) # positives at end
     infonce_loss = mx.mean(nn.losses.cross_entropy(logits, labels))
 
     return (
@@ -663,8 +668,13 @@ optimizer = AdamW(model, matrix_lr=MATRIX_LR, embedding_lr=EMBEDDING_LR, weight_
 
 loss_grad_fn = nn.value_and_grad(
     model,
-    lambda m, et, em, rt, rm, ss, smk: compute_loss(m, target_enc, et, em, rt, rm, ss, smk),
+    lambda m, et, em, rt, rm, ss, smk, qk: compute_loss(m, target_enc, et, em, rt, rm, ss, smk, qk),
 )
+
+# MoCo queue: circular buffer of L2-normalised target embeddings (numpy, not MLX)
+_queue_np = np.random.randn(QUEUE_SIZE, N_EMBD).astype(np.float32)
+_queue_np /= np.linalg.norm(_queue_np, axis=-1, keepdims=True) + 1e-8
+_queue_ptr = 0
 
 print(f"Time budget: {TIME_BUDGET}s")
 
@@ -688,7 +698,8 @@ while True:
     span_starts_t = mx.array(span_starts_np, dtype=mx.int32)
     span_mask_t   = mx.array(span_mask_np,   dtype=mx.float32)
 
-    loss, grads = loss_grad_fn(model, expr_t, expr_m, res_t, res_m, span_starts_t, span_mask_t)
+    queue_snapshot = mx.array(_queue_np, dtype=mx.float32)
+    loss, grads = loss_grad_fn(model, expr_t, expr_m, res_t, res_m, span_starts_t, span_mask_t, queue_snapshot)
     mx.eval(loss, grads)
 
     if t_compiled is None:
@@ -719,6 +730,21 @@ while True:
     tau = EMA_TAU_END - (EMA_TAU_END - EMA_TAU_START) * (math.cos(math.pi * progress) + 1) / 2
     ema_update(target_enc, model.ctx_encoder, tau)
     mx.eval(target_enc.parameters())
+
+    # Update MoCo queue with current batch's target embeddings
+    z_new = mx.stop_gradient(target_enc(res_t, res_m))
+    z_new_n = z_new * mx.rsqrt(mx.sum(z_new * z_new, axis=-1, keepdims=True) + 1e-8)
+    mx.eval(z_new_n)
+    new_keys = np.array(z_new_n)
+    B_q = new_keys.shape[0]
+    end_ptr = _queue_ptr + B_q
+    if end_ptr <= QUEUE_SIZE:
+        _queue_np[_queue_ptr:end_ptr] = new_keys
+    else:
+        first = QUEUE_SIZE - _queue_ptr
+        _queue_np[_queue_ptr:] = new_keys[:first]
+        _queue_np[:end_ptr % QUEUE_SIZE] = new_keys[first:]
+    _queue_ptr = end_ptr % QUEUE_SIZE
 
     loss_f = float(loss.item())
     if loss_f > 100 or math.isnan(loss_f):
