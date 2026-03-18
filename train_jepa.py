@@ -198,6 +198,43 @@ class EncoderBlock(nn.Module):
         return x
 
 
+class CrossAttention(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head
+        self.c_q = nn.Linear(n_embd, n_embd, bias=False)
+        self.c_k = nn.Linear(n_embd, n_embd, bias=False)
+        self.c_v = nn.Linear(n_embd, n_embd, bias=False)
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
+
+    def __call__(self, q_x, kv_x):
+        # q_x: (B, 1, D), kv_x: (B, T, D)
+        B, T, _ = kv_x.shape
+        q = self.c_q(q_x).reshape(B, 1, self.n_head, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.c_k(kv_x).reshape(B, T, self.n_head, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.c_v(kv_x).reshape(B, T, self.n_head, self.head_dim).transpose(0, 2, 1, 3)
+
+        # No RoPE for cross-attention over a pooled/set query
+        scale = 1.0 / math.sqrt(self.head_dim)
+        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=None)
+        y = y.transpose(0, 2, 1, 3).reshape(B, 1, -1)
+        return self.c_proj(y)
+
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        self.attn = CrossAttention(n_embd, n_head)
+        self.mlp = EncoderMLP(n_embd)
+
+    def __call__(self, q, kv):
+        # q: (B, 1, D), kv: (B, T, D)
+        q = q + self.attn(norm(q), norm(kv))
+        q = q + self.mlp(norm(q))
+        return q
+
+
 class AttentionPool(nn.Module):
     """Learned attention pooling: D→1 linear scores each token; softmax over non-padding."""
 
@@ -247,14 +284,14 @@ class ClojureEncoder(nn.Module):
 
 
 class NanoJEPA(nn.Module):
-    """Context encoder + predictor MLP + reverse predictor (symmetric JEPA)."""
+    """Context encoder + pure cross-attention predictor + reverse predictor (symmetric JEPA)."""
 
     def __init__(self, vocab_size, n_embd, n_layer, n_head):
         super().__init__()
         self.ctx_encoder = ClojureEncoder(vocab_size, n_embd, n_layer, n_head)
-        # Forward predictor: expr tokens → result embedding via learned query
+        # Forward predictor: expr tokens → result embedding via cross-attention
         self.res_query = mx.random.normal((1, 1, n_embd)) * 0.02
-        self.pred_blocks = [EncoderBlock(n_embd, n_head) for _ in range(2)]
+        self.pred_blocks = [CrossAttentionBlock(n_embd, n_head) for _ in range(3)]
         
         # Reverse predictor: result → expr (symmetric JEPA) - keep as MLP for now
         self.rev_pred_fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
@@ -268,14 +305,11 @@ class NanoJEPA(nn.Module):
         B, T, D = hidden_ctx.shape
         # Tile learned query for the batch
         q = mx.broadcast_to(self.res_query, (B, 1, D))
-        # Concatenate query to the beginning of context hidden states
-        # Resulting shape: (B, 1 + T, D)
-        x = mx.concatenate([q, hidden_ctx], axis=1)
-        # Pass through predictor transformer layers
+        # Pass through cross-attention predictor layers
         for block in self.pred_blocks:
-            x = block(x)
-        # z_pred is the state of the query token (index 0)
-        return norm(x[:, 0])
+            q = block(q, hidden_ctx)
+        # Prediction is the final state of the query token
+        return norm(q.squeeze(1))
 
     def predict_reverse(self, z):
         """Reverse predictor: predict expression embedding from result embedding."""
