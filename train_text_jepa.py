@@ -54,6 +54,10 @@ WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.05
 WARMDOWN_RATIO = 0.4
 TIME_BUDGET = 300
+DROPOUT_ATTN = 0.05
+DROPOUT_MLP = 0.08
+DROPOUT_EMB = 0.0
+GRAD_CLIP = 0.0
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "text")
 
@@ -80,11 +84,12 @@ def get_peak_memory_mb():
 
 
 class BidirAttention(nn.Module):
-    def __init__(self, n_embd, n_head):
+    def __init__(self, n_embd, n_head, dropout=DROPOUT_ATTN):
         super().__init__()
         self.n_head = n_head
         self.n_embd = n_embd
         self.head_dim = n_embd // n_head
+        self.dropout_rate = dropout
         assert n_embd % n_head == 0
         self.c_q = nn.Linear(n_embd, n_embd, bias=False)
         self.c_k = nn.Linear(n_embd, n_embd, bias=False)
@@ -102,18 +107,24 @@ class BidirAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.head_dim)
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=None)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, -1)
-        return self.c_proj(y)
+        y = self.c_proj(y)
+        if self.training and self.dropout_rate > 0:
+            y = nn.Dropout(self.dropout_rate)(y)
+        return y
 
 
 class EncoderMLP(nn.Module):
-    def __init__(self, n_embd):
+    def __init__(self, n_embd, dropout=DROPOUT_MLP):
         super().__init__()
         self.c_fc = nn.Linear(n_embd, 4 * n_embd, bias=False)
         self.c_proj = nn.Linear(4 * n_embd, n_embd, bias=False)
+        self.dropout_rate = dropout
 
     def __call__(self, x):
         x = self.c_fc(x)
         x = mx.maximum(x, 0) ** 2  # ReLU^2
+        if self.training and self.dropout_rate > 0:
+            x = nn.Dropout(self.dropout_rate)(x)
         return self.c_proj(x)
 
 
@@ -130,10 +141,11 @@ class EncoderBlock(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, n_embd, n_head):
+    def __init__(self, n_embd, n_head, dropout=DROPOUT_ATTN):
         super().__init__()
         self.n_head = n_head
         self.head_dim = n_embd // n_head
+        self.dropout_rate = dropout
         self.c_q = nn.Linear(n_embd, n_embd, bias=False)
         self.c_k = nn.Linear(n_embd, n_embd, bias=False)
         self.c_v = nn.Linear(n_embd, n_embd, bias=False)
@@ -147,7 +159,10 @@ class CrossAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.head_dim)
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=None)
         y = y.transpose(0, 2, 1, 3).reshape(B, 1, -1)
-        return self.c_proj(y)
+        y = self.c_proj(y)
+        if self.training and self.dropout_rate > 0:
+            y = nn.Dropout(self.dropout_rate)(y)
+        return y
 
 
 class CrossAttentionBlock(nn.Module):
@@ -183,11 +198,14 @@ class TextEncoder(nn.Module):
     def __init__(self, vocab_size, n_embd, n_layer, n_head):
         super().__init__()
         self.wte = nn.Embedding(vocab_size, n_embd)
+        self.emb_dropout_rate = DROPOUT_EMB
         self.blocks = [EncoderBlock(n_embd, n_head) for _ in range(n_layer)]
         self.pool = AttentionPool(n_embd)
 
     def _run_transformer(self, tokens):
         x = self.wte(tokens)
+        if self.training and self.emb_dropout_rate > 0:
+            x = nn.Dropout(self.emb_dropout_rate)(x)
         x = norm(x)
         for block in self.blocks:
             x = block(x)
@@ -543,6 +561,7 @@ def main():
     smooth_loss = 0.0
     total_samples = 0
     next_log_pct = 0
+    model.train()
 
     while True:
         t0 = time.time()
@@ -637,6 +656,7 @@ def main():
     print(f"Training completed in {t_train - (t_compiled or t_start):.1f}s ({step} steps)")
 
     # Save model
+    model.eval()
     save_model(model, target_enc, lang)
 
     # Final evaluation

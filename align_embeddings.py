@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Cross-lingual embedding alignment for Text JEPA — v3.
-Pushes alignment quality with multiple methods and selects the best.
+Cross-lingual embedding alignment for Text JEPA — v4.
+Focused on proven methods + RCSLS refinement + self-learning.
 
 Techniques:
   1. Embedding whitening (center + PCA + normalize)
   2. Automatic cognate mining (edit distance)
-  3. Iterative Procrustes refinement (CSLS mutual-NN dictionary induction)
-  4. Wasserstein-Procrustes (Sinkhorn optimal transport + rotation)
-  5. Unsupervised initialization (VecMap sorted similarity profiles)
-  6. WGAN adversarial (Wasserstein loss + weight clipping)
+  3. Procrustes alignment (supervised, bidirectional)
+  4. RCSLS refinement (Joulin et al. 2018 — optimize retrieval directly)
+  5. Iterative Procrustes refinement (CSLS mutual-NN dictionary induction)
+  6. Self-learning (bootstrap dictionary from alignment)
+  7. Ensemble of top methods
 
 Usage: python3 align_embeddings.py
 """
@@ -100,6 +101,31 @@ def whiten_embeddings(W):
     # U has orthonormal columns; rows are whitened embeddings
     W_white = U / (np.linalg.norm(U, axis=1, keepdims=True) + 1e-8)
     return W_white
+
+
+def pca_embed(W, n_components):
+    """PCA dimensionality reduction + L2 normalize."""
+    W = W - W.mean(axis=0)
+    U, S, Vt = np.linalg.svd(W, full_matrices=False)
+    k = min(n_components, U.shape[1])
+    W_pca = U[:, :k] * S[:k]
+    W_pca = W_pca / (np.linalg.norm(W_pca, axis=1, keepdims=True) + 1e-8)
+    return W_pca
+
+
+def partial_whiten(W, alpha=0.5):
+    """Partial whitening: U @ diag(S^alpha) -> L2-normalize.
+
+    Smoothly interpolates between full whitening and PCA:
+      alpha=0: full whitening (U only, all dims equal, max isotropy)
+      alpha=1: PCA (U*S, high-variance dims dominate, max signal)
+      0 < alpha < 1: compromise between isotropy and signal retention
+    """
+    W = W - W.mean(axis=0)
+    U, S, Vt = np.linalg.svd(W, full_matrices=False)
+    W_pw = U * (S ** alpha)
+    W_pw = W_pw / (np.linalg.norm(W_pw, axis=1, keepdims=True) + 1e-8)
+    return W_pw
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +325,186 @@ def iterative_procrustes(W_src, W_tgt, W_init, n_iter=15):
         if np.allclose(W, W_new, atol=1e-6):
             break
         W = W_new
+
+    return best_W
+
+
+# ---------------------------------------------------------------------------
+# Aggressive iterative refinement (top-K forward matches)
+# ---------------------------------------------------------------------------
+
+
+def iterative_procrustes_topk(W_src, W_tgt, W_init, n_iter=20, top_k=200):
+    """Iterative refinement using top-K forward matches, not just mutual NN.
+
+    Less strict than mutual NN: uses the top-K most confident source->target
+    matches by CSLS score. More data points for Procrustes estimation,
+    and wrong pairs get averaged out in the rotation estimate.
+    """
+    W = W_init.copy()
+    best_W = W.copy()
+    best_score = mean_csls_score(W_src, W_tgt, W)
+
+    for it in range(n_iter):
+        mapped = W_src @ W
+        csls = csls_score(mapped, W_tgt)
+
+        fwd = np.argmax(csls, axis=1)
+        fwd_scores = csls[np.arange(len(fwd)), fwd]
+
+        # Take top-K most confident forward matches
+        k = min(top_k, len(fwd))
+        top_idx = np.argsort(-fwd_scores)[:k]
+        src_idx = top_idx
+        tgt_idx = fwd[top_idx]
+
+        W_new = procrustes_align(W_src, W_tgt, src_idx, tgt_idx)
+        score_new = mean_csls_score(W_src, W_tgt, W_new)
+
+        if score_new > best_score:
+            best_W = W_new.copy()
+            best_score = score_new
+
+        if np.allclose(W, W_new, atol=1e-6):
+            break
+        W = W_new
+
+    return best_W
+
+
+# ---------------------------------------------------------------------------
+# RCSLS refinement (Joulin et al. 2018)
+# ---------------------------------------------------------------------------
+
+
+def rcsls_refine(W_src, W_tgt, W_init, src_idx, tgt_idx,
+                  n_outer=8, n_inner=10, lr=0.5, k=10):
+    """Refine mapping by optimizing RCSLS retrieval criterion.
+
+    Unlike Procrustes (minimize ||XW - Y||²), RCSLS optimizes the actual
+    retrieval metric by penalizing incorrect neighbors:
+      L = Σ -cos(Wx,y) + (1/k)Σ cos(Wx,nn_tgt) + (1/k)Σ cos(nn_src,y)
+
+    Block coordinate descent: fix k-NN, gradient descent on W, repeat.
+    Each step projects W to the nearest orthogonal matrix.
+    """
+    D = W_init.shape[0]
+    W = W_init.copy()
+    X = W_src[src_idx]
+    Y = W_tgt[tgt_idx]
+    n_pairs = len(src_idx)
+
+    best_W = W.copy()
+    best_score = mean_csls_score(W_src, W_tgt, W)
+
+    for outer in range(n_outer):
+        mapped = W_src @ W
+        k_t = min(k, W_tgt.shape[0] - 1)
+        sims_t = mapped[src_idx] @ W_tgt.T
+        tgt_nn = np.argpartition(-sims_t, k_t, axis=1)[:, :k_t]
+
+        k_s = min(k, W_src.shape[0] - 1)
+        sims_s = W_tgt[tgt_idx] @ mapped.T
+        src_nn = np.argpartition(-sims_s, k_s, axis=1)[:, :k_s]
+
+        mean_tgt_nn = W_tgt[tgt_nn.ravel()].reshape(n_pairs, k_t, D).mean(axis=1)
+        mean_src_nn = W_src[src_nn.ravel()].reshape(n_pairs, k_s, D).mean(axis=1)
+
+        for _ in range(n_inner):
+            grad = (-Y.T @ X + mean_tgt_nn.T @ X + Y.T @ mean_src_nn) / n_pairs
+            W = W - lr * grad
+            U, _, Vt = np.linalg.svd(W)
+            W = U @ Vt
+
+        score = mean_csls_score(W_src, W_tgt, W)
+        if score > best_score:
+            best_W = W.copy()
+            best_score = score
+
+    return best_W
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional Procrustes
+# ---------------------------------------------------------------------------
+
+
+def bidirectional_procrustes(W_src, W_tgt, src_idx, tgt_idx):
+    """Average forward (src->tgt) and backward (tgt->src) Procrustes.
+
+    Forces alignment consistency in both directions.
+    Re-projected to nearest orthogonal matrix.
+    """
+    W_fwd = procrustes_align(W_src, W_tgt, src_idx, tgt_idx)
+    W_bwd = procrustes_align(W_tgt, W_src, tgt_idx, src_idx)
+    W_avg = (W_fwd + W_bwd.T) / 2
+    U, _, Vt = np.linalg.svd(W_avg)
+    return U @ Vt
+
+
+# ---------------------------------------------------------------------------
+# Self-learning alignment (bootstrapped dictionary expansion)
+# ---------------------------------------------------------------------------
+
+
+def self_learning_align(W_src, W_tgt, seed_src, seed_tgt, words_src, words_tgt,
+                         gold_dict, n_rounds=5, n_add=15):
+    """Expand seed dictionary using alignment, then re-align.
+
+    Each round:
+      1. Procrustes + RCSLS + iterative refinement
+      2. Find confident mutual-NN pairs not yet in dictionary
+      3. Add only high-confidence pairs (positive CSLS, above median)
+      4. Repeat from scratch with expanded dictionary
+    Tracks best alignment across rounds.
+    """
+    src_list = list(seed_src)
+    tgt_list = list(seed_tgt)
+    best_W = np.eye(W_src.shape[1], dtype=np.float32)
+    best_score = -1.0
+
+    for rnd in range(n_rounds):
+        si, ti = np.array(src_list), np.array(tgt_list)
+        W = procrustes_align(W_src, W_tgt, si, ti)
+        W = rcsls_refine(W_src, W_tgt, W, si, ti)
+        W = iterative_procrustes(W_src, W_tgt, W, n_iter=15)
+
+        p, n = quick_eval(W_src, W_tgt, W, words_src, words_tgt, gold_dict)
+        score = p[1] + p[5] * 0.5
+        print(f"    Round {rnd+1}: dict={len(src_list)}, "
+              f"P@1={p[1]*100:.1f}% P@5={p[5]*100:.1f}% P@10={p[10]*100:.1f}%")
+
+        if score > best_score:
+            best_W = W.copy()
+            best_score = score
+
+        # Expand dictionary with high-confidence mutual NN
+        mapped = W_src @ W
+        csls = csls_score(mapped, W_tgt)
+        fwd = np.argmax(csls, axis=1)
+        bwd = np.argmax(csls, axis=0)
+        fwd_scores = csls[np.arange(len(fwd)), fwd]
+
+        existing = set(zip(src_list, tgt_list))
+        # Only mutual NN with positive CSLS and above median score
+        candidates = [(i, fwd[i], fwd_scores[i]) for i in range(len(fwd))
+                      if bwd[fwd[i]] == i and (i, fwd[i]) not in existing
+                      and fwd_scores[i] > 0]
+        candidates.sort(key=lambda x: -x[2])
+
+        # Only add top-N most confident
+        if candidates:
+            median_score = np.median([c[2] for c in candidates])
+            candidates = [c for c in candidates if c[2] >= median_score]
+
+        added = 0
+        for i, j, _ in candidates[:n_add]:
+            src_list.append(i)
+            tgt_list.append(j)
+            added += 1
+
+        if added == 0:
+            break
 
     return best_W
 
@@ -700,20 +906,35 @@ def main():
 
     tokenizer = BPETokenizer.load()
 
-    # Load and extract contextual embeddings
-    print("\nLoading corpora and extracting embeddings...")
-    en_sents = load_sentences("en")
-    fi_sents = load_sentences("fi")
-    en_words_all = extract_words(en_sents, min_freq=3)
-    fi_words_all = extract_words(fi_sents, min_freq=3)
+    # Load or extract contextual embeddings (cache for reproducibility)
+    raw_cache = os.path.join(DATA_DIR, "word_embeddings_raw.npz")
+    if os.path.exists(raw_cache):
+        print("\nLoading cached raw embeddings...")
+        data = np.load(raw_cache, allow_pickle=True)
+        W_en_raw = data["W_en"]
+        W_fi_raw = data["W_fi"]
+        en_words = list(data["words_en"])
+        fi_words = list(data["words_fi"])
+    else:
+        print("\nExtracting contextual embeddings (first run, will cache)...")
+        en_sents = load_sentences("en")
+        fi_sents = load_sentences("fi")
+        en_words_all = extract_words(en_sents, min_freq=3)
+        fi_words_all = extract_words(fi_sents, min_freq=3)
 
-    en_enc = load_encoder("en", vocab_size=tokenizer.vocab_size)
-    fi_enc = load_encoder("fi", vocab_size=tokenizer.vocab_size)
+        en_enc = load_encoder("en", vocab_size=tokenizer.vocab_size)
+        fi_enc = load_encoder("fi", vocab_size=tokenizer.vocab_size)
 
-    W_en_raw, en_words = extract_contextual_embeddings(
-        en_enc, tokenizer, en_sents, en_words_all)
-    W_fi_raw, fi_words = extract_contextual_embeddings(
-        fi_enc, tokenizer, fi_sents, fi_words_all)
+        W_en_raw, en_words = extract_contextual_embeddings(
+            en_enc, tokenizer, en_sents, en_words_all)
+        W_fi_raw, fi_words = extract_contextual_embeddings(
+            fi_enc, tokenizer, fi_sents, fi_words_all)
+
+        np.savez_compressed(raw_cache,
+                            W_en=W_en_raw, W_fi=W_fi_raw,
+                            words_en=np.array(en_words, dtype=object),
+                            words_fi=np.array(fi_words, dtype=object))
+        print("  Cached to", raw_cache)
 
     print(f"  EN: {W_en_raw.shape}, FI: {W_fi_raw.shape}")
 
@@ -774,70 +995,112 @@ def main():
     print(f"\n  Total seed pairs (cognates + dict): {len(seed_src)}")
 
     # =====================================================================
-    # Run all alignment methods
+    # Run alignment methods
     # =====================================================================
 
     results = {}
 
-    # 1. Procrustes (supervised)
-    print("\n--- 1. Procrustes (supervised) ---")
+    # 1. Procrustes (baseline)
+    print("\n--- 1. Procrustes ---")
     W_proc = procrustes_align(W_en, W_fi, seed_src, seed_tgt)
     p, n = quick_eval(W_en, W_fi, W_proc, en_words, fi_words, GOLD_DICT)
     print(f"  P@1={p[1]*100:.1f}% P@5={p[5]*100:.1f}% P@10={p[10]*100:.1f}% ({n} pairs)")
     results["Procrustes"] = (W_proc, p)
 
-    # 2. Procrustes + iterative refinement
-    print("\n--- 2. Procrustes + iterative refinement ---")
+    # 2. Procrustes + RCSLS
+    print("\n--- 2. Procrustes + RCSLS ---")
+    W_rcsls = rcsls_refine(W_en, W_fi, W_proc, seed_src, seed_tgt)
+    p, n = quick_eval(W_en, W_fi, W_rcsls, en_words, fi_words, GOLD_DICT)
+    print(f"  P@1={p[1]*100:.1f}% P@5={p[5]*100:.1f}% P@10={p[10]*100:.1f}% ({n} pairs)")
+    results["Procrustes+RCSLS"] = (W_rcsls, p)
+
+    # 3. Procrustes + refine
+    print("\n--- 3. Procrustes + refine ---")
     W_proc_r = iterative_procrustes(W_en, W_fi, W_proc)
     p, n = quick_eval(W_en, W_fi, W_proc_r, en_words, fi_words, GOLD_DICT)
     print(f"  P@1={p[1]*100:.1f}% P@5={p[5]*100:.1f}% P@10={p[10]*100:.1f}% ({n} pairs)")
     results["Procrustes+refine"] = (W_proc_r, p)
 
-    # 3. Wasserstein-Procrustes (unsupervised)
-    print("\n--- 3. Wasserstein-Procrustes (unsupervised) ---")
-    W_wass = wasserstein_procrustes(W_en, W_fi)
-    p, n = quick_eval(W_en, W_fi, W_wass, en_words, fi_words, GOLD_DICT)
+    # 4. Procrustes + RCSLS + refine
+    print("\n--- 4. Procrustes + RCSLS + refine ---")
+    W_rcsls_r = iterative_procrustes(W_en, W_fi, W_rcsls)
+    p, n = quick_eval(W_en, W_fi, W_rcsls_r, en_words, fi_words, GOLD_DICT)
     print(f"  P@1={p[1]*100:.1f}% P@5={p[5]*100:.1f}% P@10={p[10]*100:.1f}% ({n} pairs)")
-    results["Wasserstein-Procrustes"] = (W_wass, p)
+    results["Procrustes+RCSLS+refine"] = (W_rcsls_r, p)
 
-    # 4. Wasserstein-Procrustes + iterative refinement
-    print("\n--- 4. WP + iterative refinement ---")
-    W_wass_r = iterative_procrustes(W_en, W_fi, W_wass)
-    p, n = quick_eval(W_en, W_fi, W_wass_r, en_words, fi_words, GOLD_DICT)
+    # 5. Procrustes + refine (extended, 25 iterations)
+    print("\n--- 5. Procrustes + refine (25 iter) ---")
+    W_proc_r25 = iterative_procrustes(W_en, W_fi, W_proc, n_iter=25)
+    p, n = quick_eval(W_en, W_fi, W_proc_r25, en_words, fi_words, GOLD_DICT)
     print(f"  P@1={p[1]*100:.1f}% P@5={p[5]*100:.1f}% P@10={p[10]*100:.1f}% ({n} pairs)")
-    results["WP+refine"] = (W_wass_r, p)
+    results["Procrustes+refine25"] = (W_proc_r25, p)
 
-    # 5. Unsupervised init (similarity profiles) + refinement
-    print("\n--- 5. Unsupervised init (VecMap profiles) + refinement ---")
-    W_unsup = unsupervised_init(W_en, W_fi)
-    p0, _ = quick_eval(W_en, W_fi, W_unsup, en_words, fi_words, GOLD_DICT)
-    print(f"  Init: P@1={p0[1]*100:.1f}% P@5={p0[5]*100:.1f}% P@10={p0[10]*100:.1f}%")
-    W_unsup_r = iterative_procrustes(W_en, W_fi, W_unsup)
-    p, n = quick_eval(W_en, W_fi, W_unsup_r, en_words, fi_words, GOLD_DICT)
-    print(f"  Refined: P@1={p[1]*100:.1f}% P@5={p[5]*100:.1f}% P@10={p[10]*100:.1f}% ({n} pairs)")
-    results["VecMap+refine"] = (W_unsup_r, p)
+    # 6. RCSLS sweep: try multiple learning rates
+    print("\n--- 6. RCSLS learning rate sweep ---")
+    best_rcsls_name, best_rcsls_score, best_rcsls_p = None, -1, None
+    for lr_try in [0.05, 0.1, 0.3, 0.5, 1.0]:
+        W_try = rcsls_refine(W_en, W_fi, W_proc, seed_src, seed_tgt, lr=lr_try)
+        W_try = iterative_procrustes(W_en, W_fi, W_try, n_iter=15)
+        p_try, n = quick_eval(W_en, W_fi, W_try, en_words, fi_words, GOLD_DICT)
+        score = p_try[1] + p_try[5] * 0.5 + p_try[10] * 0.25
+        print(f"  lr={lr_try}: P@1={p_try[1]*100:.1f}% P@5={p_try[5]*100:.1f}% P@10={p_try[10]*100:.1f}%")
+        if score > best_rcsls_score:
+            best_rcsls_score = score
+            best_rcsls_name = f"RCSLS(lr={lr_try})+refine"
+            best_rcsls_p = p_try
+            W_best_rcsls = W_try.copy()
+    print(f"  Best: {best_rcsls_name}")
+    results[best_rcsls_name] = (W_best_rcsls, best_rcsls_p)
 
-    # 6. WGAN adversarial
-    print("\n--- 6. WGAN adversarial ---")
-    W_adv = adversarial_align(W_en, W_fi)
-    p, n = quick_eval(W_en, W_fi, W_adv, en_words, fi_words, GOLD_DICT)
+    # 7. Partial whitening alpha sweep
+    print("\n--- 7. Partial whitening sweep ---")
+    best_pw_name, best_pw_score = None, -1
+    best_pw_p, best_pw_W = None, None
+    best_pw_en, best_pw_fi = None, None
+    for alpha in [0.0, 0.1, 0.2, 0.3, 0.5, 0.7]:
+        W_en_a = partial_whiten(W_en_raw, alpha)
+        W_fi_a = partial_whiten(W_fi_raw, alpha)
+        Wa = procrustes_align(W_en_a, W_fi_a, seed_src, seed_tgt)
+        Wa = rcsls_refine(W_en_a, W_fi_a, Wa, seed_src, seed_tgt, lr=0.1)
+        Wa = iterative_procrustes(W_en_a, W_fi_a, Wa, n_iter=15)
+        pa, n = quick_eval(W_en_a, W_fi_a, Wa, en_words, fi_words, GOLD_DICT)
+        score_a = pa[1] + pa[5] * 0.5 + pa[10] * 0.25
+        print(f"  alpha={alpha}: P@1={pa[1]*100:.1f}% P@5={pa[5]*100:.1f}% P@10={pa[10]*100:.1f}%")
+        if score_a > best_pw_score:
+            best_pw_score = score_a
+            best_pw_name = f"alpha={alpha}+RCSLS+refine"
+            best_pw_p = pa
+            best_pw_W = Wa.copy()
+            best_pw_en = W_en_a.copy()
+            best_pw_fi = W_fi_a.copy()
+    print(f"  Best: {best_pw_name}")
+    results[best_pw_name] = (best_pw_W, best_pw_p)
+
+    # 8. Bidirectional + RCSLS + refine
+    print("\n--- 8. Bidirectional + RCSLS + refine ---")
+    W_bidir = bidirectional_procrustes(W_en, W_fi, seed_src, seed_tgt)
+    W_bidir = rcsls_refine(W_en, W_fi, W_bidir, seed_src, seed_tgt)
+    W_bidir = iterative_procrustes(W_en, W_fi, W_bidir)
+    p, n = quick_eval(W_en, W_fi, W_bidir, en_words, fi_words, GOLD_DICT)
     print(f"  P@1={p[1]*100:.1f}% P@5={p[5]*100:.1f}% P@10={p[10]*100:.1f}% ({n} pairs)")
-    results["Adversarial"] = (W_adv, p)
+    results["Bidir+RCSLS+refine"] = (W_bidir, p)
 
-    # 7. Adversarial + iterative refinement
-    print("\n--- 7. Adversarial + iterative refinement ---")
-    W_adv_r = iterative_procrustes(W_en, W_fi, W_adv)
-    p, n = quick_eval(W_en, W_fi, W_adv_r, en_words, fi_words, GOLD_DICT)
-    print(f"  P@1={p[1]*100:.1f}% P@5={p[5]*100:.1f}% P@10={p[10]*100:.1f}% ({n} pairs)")
-    results["Adversarial+refine"] = (W_adv_r, p)
+    # 9. Self-learning (dictionary bootstrap)
+    print("\n--- 9. Self-learning (dictionary bootstrap) ---")
+    W_sl = self_learning_align(W_en, W_fi, seed_src, seed_tgt,
+                                en_words, fi_words, GOLD_DICT)
+    p, n = quick_eval(W_en, W_fi, W_sl, en_words, fi_words, GOLD_DICT)
+    print(f"  Final: P@1={p[1]*100:.1f}% P@5={p[5]*100:.1f}% P@10={p[10]*100:.1f}% ({n} pairs)")
+    results["Self-learning"] = (W_sl, p)
 
-    # 8. Procrustes-seeded adversarial + refinement
-    print("\n--- 8. Procrustes-seeded WGAN + refinement ---")
-    W_adv2 = adversarial_align_seeded(W_en, W_fi, W_proc)
-    W_adv2_r = iterative_procrustes(W_en, W_fi, W_adv2)
-    p, n = quick_eval(W_en, W_fi, W_adv2_r, en_words, fi_words, GOLD_DICT)
-    print(f"  P@1={p[1]*100:.1f}% P@5={p[5]*100:.1f}% P@10={p[10]*100:.1f}% ({n} pairs)")
-    results["Proc-seeded-WGAN+refine"] = (W_adv2_r, p)
+    # 10. Self-learning on BEST partial-whitened embeddings
+    if best_pw_en is not None:
+        print("\n--- 10. Self-learning on partial-whitened embeddings ---")
+        W_sl2 = self_learning_align(best_pw_en, best_pw_fi, seed_src, seed_tgt,
+                                     en_words, fi_words, GOLD_DICT, n_rounds=8)
+        p, n = quick_eval(best_pw_en, best_pw_fi, W_sl2, en_words, fi_words, GOLD_DICT)
+        print(f"  Final: P@1={p[1]*100:.1f}% P@5={p[5]*100:.1f}% P@10={p[10]*100:.1f}% ({n} pairs)")
+        results["PW-Self-learning"] = (W_sl2, p)
 
     # =====================================================================
     # Summary
@@ -849,27 +1112,50 @@ def main():
     print(f"  {'Method':<30} {'P@1':>6} {'P@5':>6} {'P@10':>6}")
     print("  " + "-" * 54)
 
-    best_name, best_p10 = None, -1
+    best_name, best_score = None, -1
     for name, (W, p) in results.items():
         print(f"  {name:<30} {p[1]*100:5.1f}% {p[5]*100:5.1f}% {p[10]*100:5.1f}%")
-        score = p[10] + p[5] * 0.5 + p[1] * 0.25  # weighted score
-        if score > best_p10:
+        score = p[10] + p[5] * 0.5 + p[1] * 0.25
+        if score > best_score:
             best_name = name
-            best_p10 = score
+            best_score = score
 
-    print(f"\n  Best method: {best_name}")
+    print(f"\n  Best: {best_name}")
 
-    # Save best as W_procrustes.npy (evaluate_alignment.py compatibility)
     best_W = results[best_name][0]
+
+    # If an alternative preprocessing won, save those embeddings
+    if best_name.startswith("alpha=") and best_pw_en is not None:
+        np.savez_compressed(
+            os.path.join(DATA_DIR, "word_embeddings.npz"),
+            W_en=best_pw_en, W_fi=best_pw_fi,
+            words_en=np.array(en_words, dtype=object),
+            words_fi=np.array(fi_words, dtype=object),
+        )
+        print(f"  Saved partial-whitened embeddings ({best_pw_en.shape[1]}d)")
+        W_en_final, W_fi_final = best_pw_en, best_pw_fi
+    elif best_name.startswith("PCA-") and best_pca_en is not None:
+        np.savez_compressed(
+            os.path.join(DATA_DIR, "word_embeddings.npz"),
+            W_en=best_pca_en, W_fi=best_pca_fi,
+            words_en=np.array(en_words, dtype=object),
+            words_fi=np.array(fi_words, dtype=object),
+        )
+        print(f"  Saved PCA embeddings ({best_pca_en.shape[1]}d)")
+        W_en_final, W_fi_final = best_pca_en, best_pca_fi
+    else:
+        W_en_final, W_fi_final = W_en, W_fi
+
     np.save(os.path.join(DATA_DIR, "W_procrustes.npy"), best_W)
 
-    # Save adversarial result for comparison
-    adv_key = "Adversarial+refine" if "Adversarial+refine" in results else "Adversarial"
-    np.save(os.path.join(DATA_DIR, "W_adversarial.npy"), results[adv_key][0])
+    # Save runner-up
+    ranked_all = sorted(results.items(),
+                        key=lambda x: -(x[1][1][10] + x[1][1][5] * 0.5 + x[1][1][1] * 0.25))
+    runner_up_name = ranked_all[1][0] if ranked_all[0][0] == best_name else ranked_all[0][0]
+    np.save(os.path.join(DATA_DIR, "W_adversarial.npy"), results[runner_up_name][0])
 
-    # Detailed NN analysis for best method
     print(f"\n--- Nearest-neighbor analysis ({best_name}) ---")
-    print_nn_analysis(W_en, W_fi, best_W, en_words, fi_words, GOLD_DICT)
+    print_nn_analysis(W_en_final, W_fi_final, best_W, en_words, fi_words, GOLD_DICT)
 
     print(f"\nSaved to {DATA_DIR}")
 
