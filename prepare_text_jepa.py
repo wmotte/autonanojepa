@@ -337,9 +337,9 @@ def make_masked_pair_bpe(sentence, tokenizer, rng, max_ctx_len=MAX_CTX_LEN, max_
         ids = ids + [PAD_ID] * (4 - n)
         n = 4
 
-    # Span: 20-50% of token length (larger spans force semantic reasoning)
-    min_span = max(2, int(n * 0.20))
-    max_span = min(int(n * 0.50), max_tgt_len - 2, n - 1)
+    # Span: 15-40% of token length, at least 2 tokens
+    min_span = max(2, int(n * 0.15))
+    max_span = min(int(n * 0.40), max_tgt_len - 2, n - 1)
     if min_span > max_span:
         min_span = max(2, max_span)
     span_len = rng.randint(min_span, max(min_span + 1, max_span + 1))
@@ -373,25 +373,8 @@ def make_masked_pair_bpe(sentence, tokenizer, rng, max_ctx_len=MAX_CTX_LEN, max_
     )
 
 
-def _augment_sentence(sent, rng, word_drop_p=0.1, word_swap_p=0.1):
-    """Augment sentence by randomly dropping or swapping words."""
-    words = sent.split()
-    if len(words) <= 3:
-        return sent
-    # Random word drop (skip first and last word to preserve sentence structure)
-    if rng.random() < 0.5 and len(words) > 4:
-        words = [w for i, w in enumerate(words)
-                 if i == 0 or i == len(words) - 1 or rng.random() > word_drop_p]
-    # Random adjacent word swap
-    if rng.random() < 0.5 and len(words) > 3:
-        for i in range(1, len(words) - 1):
-            if rng.random() < word_swap_p:
-                words[i], words[i - 1] = words[i - 1], words[i]
-    return " ".join(words)
-
-
 def make_text_dataloader(sentences, tokenizer, batch_size, max_ctx_len=MAX_CTX_LEN, max_tgt_len=MAX_TGT_LEN):
-    """Infinite generator. 50% full sentences, 50% sub-spans. Applies augmentation."""
+    """Infinite generator. 50% full sentences, 50% sub-spans."""
     rng = random.Random(42)
     while True:
         ctx_batch, ctx_mask_batch, tgt_batch, tgt_mask_batch = [], [], [], []
@@ -406,10 +389,6 @@ def make_text_dataloader(sentences, tokenizer, batch_size, max_ctx_len=MAX_CTX_L
                 clauses = [c.strip() for c in clauses if len(c.strip()) > 15]
                 if clauses:
                     sent = rng.choice(clauses)
-
-            # Apply word-level augmentation (25% of the time)
-            if rng.random() < 0.25:
-                sent = _augment_sentence(sent, rng)
 
             ctx_ids, ctx_mask, tgt_ids, tgt_mask = make_masked_pair_bpe(
                 sent, tokenizer, rng, max_ctx_len, max_tgt_len

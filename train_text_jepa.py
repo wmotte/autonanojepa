@@ -36,9 +36,10 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-N_EMBD = 128
-DEPTH = 4
+N_EMBD = 96
+DEPTH = 3
 N_HEAD = 4
+N_PRED = 2
 EMA_TAU_START = 0.996
 EMA_TAU_END = 0.9999
 VICREG_LAMBDA = 1.0
@@ -54,10 +55,6 @@ WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.05
 WARMDOWN_RATIO = 0.4
 TIME_BUDGET = 300
-DROPOUT_ATTN = 0.05
-DROPOUT_MLP = 0.08
-DROPOUT_EMB = 0.0
-GRAD_CLIP = 0.0
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "text")
 
@@ -84,12 +81,11 @@ def get_peak_memory_mb():
 
 
 class BidirAttention(nn.Module):
-    def __init__(self, n_embd, n_head, dropout=DROPOUT_ATTN):
+    def __init__(self, n_embd, n_head):
         super().__init__()
         self.n_head = n_head
         self.n_embd = n_embd
         self.head_dim = n_embd // n_head
-        self.dropout_rate = dropout
         assert n_embd % n_head == 0
         self.c_q = nn.Linear(n_embd, n_embd, bias=False)
         self.c_k = nn.Linear(n_embd, n_embd, bias=False)
@@ -107,24 +103,18 @@ class BidirAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.head_dim)
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=None)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, -1)
-        y = self.c_proj(y)
-        if self.training and self.dropout_rate > 0:
-            y = nn.Dropout(self.dropout_rate)(y)
-        return y
+        return self.c_proj(y)
 
 
 class EncoderMLP(nn.Module):
-    def __init__(self, n_embd, dropout=DROPOUT_MLP):
+    def __init__(self, n_embd):
         super().__init__()
         self.c_fc = nn.Linear(n_embd, 4 * n_embd, bias=False)
         self.c_proj = nn.Linear(4 * n_embd, n_embd, bias=False)
-        self.dropout_rate = dropout
 
     def __call__(self, x):
         x = self.c_fc(x)
         x = mx.maximum(x, 0) ** 2  # ReLU^2
-        if self.training and self.dropout_rate > 0:
-            x = nn.Dropout(self.dropout_rate)(x)
         return self.c_proj(x)
 
 
@@ -141,11 +131,10 @@ class EncoderBlock(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, n_embd, n_head, dropout=DROPOUT_ATTN):
+    def __init__(self, n_embd, n_head):
         super().__init__()
         self.n_head = n_head
         self.head_dim = n_embd // n_head
-        self.dropout_rate = dropout
         self.c_q = nn.Linear(n_embd, n_embd, bias=False)
         self.c_k = nn.Linear(n_embd, n_embd, bias=False)
         self.c_v = nn.Linear(n_embd, n_embd, bias=False)
@@ -159,10 +148,7 @@ class CrossAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.head_dim)
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=None)
         y = y.transpose(0, 2, 1, 3).reshape(B, 1, -1)
-        y = self.c_proj(y)
-        if self.training and self.dropout_rate > 0:
-            y = nn.Dropout(self.dropout_rate)(y)
-        return y
+        return self.c_proj(y)
 
 
 class CrossAttentionBlock(nn.Module):
@@ -198,14 +184,11 @@ class TextEncoder(nn.Module):
     def __init__(self, vocab_size, n_embd, n_layer, n_head):
         super().__init__()
         self.wte = nn.Embedding(vocab_size, n_embd)
-        self.emb_dropout_rate = DROPOUT_EMB
         self.blocks = [EncoderBlock(n_embd, n_head) for _ in range(n_layer)]
         self.pool = AttentionPool(n_embd)
 
     def _run_transformer(self, tokens):
         x = self.wte(tokens)
-        if self.training and self.emb_dropout_rate > 0:
-            x = nn.Dropout(self.emb_dropout_rate)(x)
         x = norm(x)
         for block in self.blocks:
             x = block(x)
@@ -227,11 +210,11 @@ class TextEncoder(nn.Module):
 
 
 class TextJEPA(nn.Module):
-    def __init__(self, vocab_size, n_embd, n_layer, n_head):
+    def __init__(self, vocab_size, n_embd, n_layer, n_head, n_pred=N_PRED):
         super().__init__()
         self.ctx_encoder = TextEncoder(vocab_size, n_embd, n_layer, n_head)
         self.res_query = mx.random.normal((1, 1, n_embd)) * 0.02
-        self.pred_blocks = [CrossAttentionBlock(n_embd, n_head) for _ in range(3)]
+        self.pred_blocks = [CrossAttentionBlock(n_embd, n_head) for _ in range(n_pred)]
 
     def predict(self, hidden_ctx):
         B, T, D = hidden_ctx.shape
@@ -538,7 +521,7 @@ def main():
 
     num_params = sum(p.size for _, p in tree_flatten(model.parameters()))
     num_target_params = sum(p.size for _, p in tree_flatten(target_enc.parameters()))
-    print(f"Model params (trainable): {num_params / 1e6:.2f}M")
+    print(f"Model params (trainable): {num_params / 1e6:.2f}M ({num_params:,})")
     print(f"Target encoder params (EMA only): {num_target_params / 1e6:.2f}M")
 
     # Optimizer
@@ -561,7 +544,6 @@ def main():
     smooth_loss = 0.0
     total_samples = 0
     next_log_pct = 0
-    model.train()
 
     while True:
         t0 = time.time()
@@ -656,7 +638,6 @@ def main():
     print(f"Training completed in {t_train - (t_compiled or t_start):.1f}s ({step} steps)")
 
     # Save model
-    model.eval()
     save_model(model, target_enc, lang)
 
     # Final evaluation
